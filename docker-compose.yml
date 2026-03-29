@@ -1,0 +1,34 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: indexer
+      POSTGRES_PASSWORD: indexer
+      POSTGRES_DB: solana_indexer
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U indexer"]
+      interval: 5s
+      retries: 5
+
+  indexer:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://indexer:indexer@postgres:5432/solana_indexer
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./idl.json:/app/idl.json:ro
+    restart: unless-stopped
+
+volumes:
+  pgdata:

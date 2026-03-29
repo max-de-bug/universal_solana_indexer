@@ -1,0 +1,48 @@
+[package]
+name = "universal-solana-indexer"
+version = "0.1.0"
+edition = "2021"
+description = "A production-ready, universal Solana indexer that dynamically adapts to any Anchor IDL"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Web framework
+axum = { version = "0.7", features = ["json"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "chrono"] }
+
+# Solana
+solana-client = "2.1"
+solana-sdk = "2.1"
+solana-transaction-status = "2.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bs58 = "0.5"
+base64 = "0.22"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Crypto (discriminator computation)
+sha2 = "0.10"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Utilities
+tokio-util = "0.7"
+bincode = "1"
+
+# Config
+dotenvy = "0.15"
