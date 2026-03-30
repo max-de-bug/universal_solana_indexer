@@ -72,9 +72,10 @@ async fn main() -> anyhow::Result<()> {
 
     // ---- Indexer ------------------------------------------------------------
     let fetcher = Fetcher::new(
-        &config.rpc_url,
+        &config.rpc_urls,
         config.max_retries,
         config.initial_retry_delay_ms,
+        cancel.clone(),
     );
 
     let indexer_state = Arc::new(IndexerState {
@@ -126,7 +127,7 @@ async fn load_idl(config: &Config) -> anyhow::Result<AnchorIdl> {
         let pubkey = Pubkey::from_str(addr)
             .map_err(|e| anyhow::anyhow!("Invalid IDL_ACCOUNT address: {e}"))?;
         let rpc = RpcClient::new_with_commitment(
-            config.rpc_url.clone(),
+            config.rpc_urls.first().cloned().unwrap_or_else(|| "https://api.mainnet-beta.solana.com".into()),
             CommitmentConfig::confirmed(),
         );
         info!(%addr, "Fetching IDL from on-chain account");

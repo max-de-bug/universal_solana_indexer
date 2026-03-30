@@ -49,4 +49,6 @@ dotenvy = "0.15"
 
 # On-chain IDL decompression
 flate2 = "1.0"
+parking_lot = "0.12"
+futures-util = "0.3.32"
 

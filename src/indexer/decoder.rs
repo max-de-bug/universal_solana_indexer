@@ -9,7 +9,7 @@ use tracing::warn;
 
 /// Identify an instruction by matching the first 8 bytes against IDL discriminators.
 pub fn match_instruction<'a>(
-    data: &[u8],
+    data: &'a [u8],
     idl: &'a AnchorIdl,
 ) -> Option<(&'a crate::idl::IdlInstruction, &'a [u8])> {
     if data.len() < 8 {
@@ -24,7 +24,7 @@ pub fn match_instruction<'a>(
 
 /// Identify an account type by matching the first 8 bytes against IDL discriminators.
 pub fn match_account<'a>(
-    data: &[u8],
+    data: &'a [u8],
     idl: &'a AnchorIdl,
 ) -> Option<(&'a crate::idl::IdlAccountDef, &'a [u8])> {
     if data.len() < 8 {

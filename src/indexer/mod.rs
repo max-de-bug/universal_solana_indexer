@@ -3,10 +3,16 @@ pub mod fetcher;
 
 use crate::config::{Config, IndexingMode};
 use crate::db;
+use crate::error::IndexerError;
 use crate::idl::AnchorIdl;
 use crate::indexer::decoder::{decode_fields, match_account, match_instruction};
 use crate::indexer::fetcher::Fetcher;
+use anyhow::Context;
 use serde_json::json;
+use futures_util::StreamExt;
+use solana_client::nonblocking::pubsub_client::PubsubClient;
+use solana_client::rpc_config::{RpcTransactionLogsConfig, RpcTransactionLogsFilter};
+use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use solana_transaction_status::{
     EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction, UiInnerInstructions,
@@ -168,63 +174,46 @@ async fn run_realtime(state: Arc<IndexerState>) -> anyhow::Result<()> {
 
     backfill(&state, last_sig.as_deref()).await?;
 
-    // Enter polling loop.
+    // Enter WSS subscription stream.
     info!(
-        interval_ms = state.config.poll_interval_ms,
-        "Entering real-time polling loop"
+        wss = %state.config.wss_url,
+        "Entering instantaneous real-time WSS stream"
     );
-    let poll_dur = std::time::Duration::from_millis(state.config.poll_interval_ms);
+
+    let pubsub = PubsubClient::new(&state.config.wss_url).await?;
+    let (mut stream, _unsubscribe) = pubsub.logs_subscribe(
+        RpcTransactionLogsFilter::Mentions(vec![program_str.clone()]),
+        RpcTransactionLogsConfig {
+            commitment: Some(CommitmentConfig::confirmed()),
+        },
+    ).await?;
 
     loop {
-        if state.cancel.is_cancelled() {
-            info!("Real-time loop stopped by shutdown");
-            break;
-        }
-
-        // Determine the newest processed signature.
-        let latest = db::get_last_processed(&state.pool, &program_str).await?;
-        let until_sig = latest.and_then(|(_, s)| s);
-
-        let sigs = state
-            .fetcher
-            .get_signatures(
-                &state.config.program_id,
-                None,
-                until_sig.as_deref(),
-                state.config.batch_size,
-            )
-            .await?;
-
-        if sigs.is_empty() {
-            tokio::select! {
-                _ = tokio::time::sleep(poll_dur) => {}
-                _ = state.cancel.cancelled() => break,
-            }
-            continue;
-        }
-
-        // Process in chronological order (reverse the reverse-chronological response).
-        for sig_info in sigs.iter().rev() {
-            if state.cancel.is_cancelled() {
+        tokio::select! {
+            _ = state.cancel.cancelled() => {
+                info!("Real-time WSS stream stopped by shutdown");
                 break;
             }
-            if let Err(e) = process_signature(&state, &sig_info.signature, sig_info.slot).await {
-                warn!(sig = %sig_info.signature, error = %e, "Failed to process tx");
+            resp = stream.next() => {
+                match resp {
+                    Some(log) => {
+                        let sig = log.value.signature;
+                        // The socket natively streams exactly as transactions happen.
+                        // We set slot to 0 to inherently fetch the true slot when decoding.
+                        if let Err(e) = process_signature(&state, &sig, 0).await {
+                            warn!(%sig, error = %e, "Failed to process WSS tx");
+                        } else {
+                            // Optionally persist the latest parsed signature synchronously
+                            let _ = db::update_sync_state(&state.pool, &program_str, 0, Some(&sig)).await;
+                        }
+                    }
+                    None => {
+                        warn!("WSS stream closed unexpectedly");
+                        break;
+                    }
+                }
             }
         }
-
-        // Persist progress: the newest signature we just processed.
-        if let Some(newest) = sigs.first() {
-            db::update_sync_state(
-                &state.pool,
-                &program_str,
-                newest.slot,
-                Some(&newest.signature),
-            )
-            .await?;
-        }
-
-        info!(new_txs = sigs.len(), "Polled new transactions");
     }
 
     Ok(())
@@ -321,11 +310,18 @@ async fn process_signature(
     )
     .await?;
 
-    // Decode instructions (top-level + inner CPI).
-    if let Some(ui_tx) = &tx.transaction.transaction {
-        let inner_ixs = meta.and_then(|m| m.inner_instructions.as_ref());
-        decode_and_store_instructions(state, sig, slot, ui_tx, inner_ixs).await?;
-    }
+    let meta = tx.transaction.meta.as_ref();
+
+    let ui_tx = &tx.transaction.transaction;
+    let inner_ixs = meta.and_then(|m| {
+        if let solana_transaction_status::option_serializer::OptionSerializer::Some(v) = &m.inner_instructions {
+            Some(v)
+        } else {
+            None
+        }
+    });
+
+    decode_and_store_instructions(state, sig, slot, ui_tx, inner_ixs).await?;
 
     debug!(%sig, %slot, "Transaction indexed");
     Ok(())

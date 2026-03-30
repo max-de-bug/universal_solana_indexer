@@ -6,7 +6,7 @@ use tracing::info;
 /// Top-level application configuration, loaded from environment variables.
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub rpc_url: String,
+    pub rpc_urls: Vec<String>,
     pub wss_url: String,
     pub database_url: String,
     /// Path to a local IDL JSON file (takes priority over `idl_account`).
@@ -37,7 +37,8 @@ impl Config {
     /// Build configuration from environment variables.
     /// Panics early with clear messages for missing required vars.
     pub fn from_env() -> anyhow::Result<Self> {
-        let rpc_url = env_or("RPC_URL", "https://api.mainnet-beta.solana.com");
+        let rpc_urls_str = env_or("RPC_URLS", "https://api.mainnet-beta.solana.com");
+        let rpc_urls: Vec<String> = rpc_urls_str.split(',').map(|s| s.trim().to_string()).collect();
         let wss_url = env_or("WSS_URL", "wss://api.mainnet-beta.solana.com");
         let database_url = required_env("DATABASE_URL")?;
         let idl_path = std::env::var("IDL_PATH").ok();
@@ -79,7 +80,7 @@ impl Config {
         let poll_interval_ms = env_or("POLL_INTERVAL_MS", "2000").parse()?;
 
         let cfg = Self {
-            rpc_url,
+            rpc_urls,
             wss_url,
             database_url,
             idl_path,
