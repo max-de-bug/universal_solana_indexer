@@ -46,3 +46,7 @@ bincode = "1"
 
 # Config
 dotenvy = "0.15"
+
+# On-chain IDL decompression
+flate2 = "1.0"
+

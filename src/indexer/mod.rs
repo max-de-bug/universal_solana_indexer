@@ -4,17 +4,17 @@ pub mod fetcher;
 use crate::config::{Config, IndexingMode};
 use crate::db;
 use crate::idl::AnchorIdl;
-use crate::indexer::decoder::{match_account, match_instruction, decode_fields};
+use crate::indexer::decoder::{decode_fields, match_account, match_instruction};
 use crate::indexer::fetcher::Fetcher;
 use serde_json::json;
 use solana_sdk::pubkey::Pubkey;
 use solana_transaction_status::{
-    EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction, UiMessage,
+    EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction, UiInnerInstructions,
+    UiInstruction,
 };
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -29,7 +29,13 @@ pub struct IndexerState {
 
 /// Main entry: dispatch to the correct indexing strategy.
 pub async fn run(state: Arc<IndexerState>) -> anyhow::Result<()> {
-    match &state.config.mode {
+    // Spawn a parallel daemon completely dedicated to syncing Account States globally.
+    let poller_state = state.clone();
+    let poller_handle = tokio::spawn(async move {
+        run_account_poller(poller_state).await;
+    });
+
+    let res = match &state.config.mode {
         IndexingMode::Batch {
             start_slot,
             end_slot,
@@ -39,7 +45,13 @@ pub async fn run(state: Arc<IndexerState>) -> anyhow::Result<()> {
             run_batch_signatures(state.clone(), &sigs).await
         }
         IndexingMode::Realtime => run_realtime(state.clone()).await,
+    };
+
+    if !poller_handle.is_finished() {
+        poller_handle.abort();
     }
+    
+    res
 }
 
 // ---------------------------------------------------------------------------
@@ -278,18 +290,21 @@ async fn backfill(state: &IndexerState, until: Option<&str>) -> anyhow::Result<(
 async fn process_signature(
     state: &IndexerState,
     sig: &str,
-    hint_slot: u64,
+    _hint_slot: u64,
 ) -> anyhow::Result<()> {
+    // Dedup: skip if already indexed to save an RPC fetch.
+    if db::transaction_exists(&state.pool, sig).await? {
+        debug!(%sig, "Skipping already-indexed transaction");
+        return Ok(());
+    }
+
     let tx = state.fetcher.get_transaction(sig).await?;
 
     let slot = tx.slot;
     let block_time = tx.block_time;
     let meta = tx.transaction.meta.as_ref();
     let success = meta.map_or(true, |m| m.err.is_none());
-    let fee = meta.and_then(|m| {
-        // Fee is part of the meta
-        Some(m.fee)
-    });
+    let fee = meta.map(|m| m.fee);
     let err_msg = meta
         .and_then(|m| m.err.as_ref())
         .map(|e| format!("{e:?}"));
@@ -306,9 +321,10 @@ async fn process_signature(
     )
     .await?;
 
-    // Decode instructions.
+    // Decode instructions (top-level + inner CPI).
     if let Some(ui_tx) = &tx.transaction.transaction {
-        decode_and_store_instructions(state, sig, slot, ui_tx).await?;
+        let inner_ixs = meta.and_then(|m| m.inner_instructions.as_ref());
+        decode_and_store_instructions(state, sig, slot, ui_tx, inner_ixs).await?;
     }
 
     debug!(%sig, %slot, "Transaction indexed");
@@ -320,13 +336,14 @@ async fn decode_and_store_instructions(
     tx_sig: &str,
     slot: u64,
     encoded_tx: &EncodedTransaction,
+    inner_instructions: Option<&Vec<UiInnerInstructions>>,
 ) -> anyhow::Result<()> {
     let type_map = state.idl.type_map();
     let program_id_str = state.config.program_id.to_string();
 
     // Decode from base64.
     let tx_bytes = match encoded_tx {
-        EncodedTransaction::Binary(blob, encoding) => {
+        EncodedTransaction::Binary(blob, _encoding) => {
             base64::Engine::decode(
                 &base64::engine::general_purpose::STANDARD,
                 blob,
@@ -348,68 +365,123 @@ async fn decode_and_store_instructions(
 
     let account_keys = tx.message.static_account_keys();
 
+    // ---- Top-level instructions ---------------------------------------------
     for (ix_idx, ix) in tx.message.instructions().iter().enumerate() {
         let program_key = account_keys
             .get(ix.program_id_index as usize)
             .map(|k| k.to_string())
             .unwrap_or_default();
 
-        if program_key != program_id_str {
-            continue;
-        }
-
-        let data = &ix.data;
-        let accounts_json: Vec<String> = ix
-            .accounts
-            .iter()
-            .filter_map(|&idx| account_keys.get(idx as usize).map(|k| k.to_string()))
-            .collect();
-
-        if let Some((ix_def, remaining)) = match_instruction(data, &state.idl) {
-            // Decode the instruction arguments.
-            let args = decode_fields(remaining, &ix_def.args, &type_map)
-                .unwrap_or_else(|e| {
-                    warn!(ix = %ix_def.name, error = %e, "Partial arg decode");
-                    serde_json::Value::Null
-                });
-
-            db::insert_instruction(
-                &state.pool,
-                tx_sig,
-                ix_idx as i32,
-                &ix_def.name,
-                &program_id_str,
-                &args,
-                &json!(accounts_json),
-                Some(data),
+        if program_key == program_id_str {
+            process_single_instruction(
+                state, tx_sig, slot, ix_idx as i32, &ix.data, &ix.accounts,
+                account_keys, &type_map, &program_id_str,
             )
             .await?;
+        }
 
-            // Try to decode writable account states.
-            for (acc_idx, acc_meta) in ix_def.accounts.iter().enumerate() {
-                if !acc_meta.writable {
-                    continue;
-                }
-                if let Some(&key_idx) = ix.accounts.get(acc_idx) {
-                    if let Some(pubkey) = account_keys.get(key_idx as usize) {
-                        try_decode_account(state, pubkey, slot, tx_sig, &type_map).await;
+        // ---- Inner / CPI instructions for this top-level ix -----------------
+        if let Some(inners) = inner_instructions {
+            if let Some(inner_set) = inners.iter().find(|ii| ii.index as usize == ix_idx) {
+                for (cpi_offset, ui_ix) in inner_set.instructions.iter().enumerate() {
+                    if let UiInstruction::Compiled(c) = ui_ix {
+                        let inner_prog = account_keys
+                            .get(c.program_id_index as usize)
+                            .map(|k| k.to_string())
+                            .unwrap_or_default();
+
+                        if inner_prog == program_id_str {
+                            let data = bs58::decode(&c.data).into_vec().unwrap_or_default();
+                            // Label inner instructions with a distinct index.
+                            let inner_ix_idx = (ix_idx as i32) * 1000 + (cpi_offset as i32);
+                            process_single_instruction(
+                                state, tx_sig, slot, inner_ix_idx, &data, &c.accounts,
+                                account_keys, &type_map, &program_id_str,
+                            )
+                            .await?;
+                        }
                     }
                 }
             }
-        } else {
-            // Unknown instruction — store raw.
-            db::insert_instruction(
-                &state.pool,
-                tx_sig,
-                ix_idx as i32,
-                "unknown",
-                &program_id_str,
-                &serde_json::Value::Null,
-                &json!(accounts_json),
-                Some(data),
-            )
-            .await?;
         }
+    }
+
+    Ok(())
+}
+
+/// Decode and store a single instruction (used for both top-level and CPI).
+async fn process_single_instruction(
+    state: &IndexerState,
+    tx_sig: &str,
+    slot: u64,
+    ix_index: i32,
+    data: &[u8],
+    account_indices: &[u8],
+    account_keys: &[Pubkey],
+    type_map: &HashMap<String, &crate::idl::IdlTypeDef>,
+    program_id_str: &str,
+) -> anyhow::Result<()> {
+    let accounts_json: Vec<String> = account_indices
+        .iter()
+        .filter_map(|&idx| account_keys.get(idx as usize).map(|k| k.to_string()))
+        .collect();
+
+    if let Some((ix_def, remaining)) = match_instruction(data, &state.idl) {
+        // Decode the instruction arguments.
+        let args = decode_fields(remaining, &ix_def.args, type_map)
+            .unwrap_or_else(|e| {
+                warn!(ix = %ix_def.name, error = %e, "Partial arg decode");
+                serde_json::Value::Null
+            });
+
+        db::insert_instruction(
+            &state.pool,
+            tx_sig,
+            ix_index,
+            &ix_def.name,
+            program_id_str,
+            &args,
+            &json!(accounts_json),
+            Some(data),
+        )
+        .await?;
+
+        if let Err(e) = db::insert_dynamic_instruction(
+            &state.pool,
+            &state.idl.metadata.name,
+            tx_sig,
+            ix_index,
+            &ix_def.name,
+            &args,
+        )
+        .await {
+            warn!(ix = %ix_def.name, error = %e, "Dynamic native table insert failed");
+        }
+
+        // Try to decode writable account states.
+        for (acc_idx, acc_meta) in ix_def.accounts.iter().enumerate() {
+            if !acc_meta.writable {
+                continue;
+            }
+            if let Some(&key_idx) = account_indices.get(acc_idx) {
+                if let Some(pubkey) = account_keys.get(key_idx as usize) {
+                    try_decode_account(state, pubkey, slot, tx_sig, type_map).await;
+                }
+            }
+        }
+    } else {
+        // Unknown instruction — store raw.
+        db::insert_instruction(
+            &state.pool,
+            tx_sig,
+            ix_index,
+            "unknown",
+            program_id_str,
+            &serde_json::Value::Null,
+            &json!(accounts_json),
+            Some(data),
+        )
+        .await?;
     }
 
     Ok(())
@@ -452,6 +524,60 @@ async fn try_decode_account(
                     debug!(account = %acc_def.name, error = %e, "Account decode failed");
                 }
             }
+        }
+    }
+}
+
+/// A dedicated background daemon polling `getProgramAccounts` to ingest structural state globally.
+async fn run_account_poller(state: Arc<IndexerState>) {
+    // We poll GPA significantly less frequently than realtime slots to avoid burning RPC limits.
+    // 30 seconds default.
+    let poll_dur = std::time::Duration::from_secs(30);
+
+    loop {
+        if state.cancel.is_cancelled() {
+            break;
+        }
+
+        info!("Fetching global program accounts chunk...");
+        match state.fetcher.get_program_accounts(&state.config.program_id).await {
+            Ok(accounts) => {
+                let type_map = state.idl.type_map();
+                let mut success_count = 0;
+                
+                for (pubkey, account) in accounts {
+                    if state.cancel.is_cancelled() {
+                        break;
+                    }
+
+                    if let Some((acc_def, remaining)) = match_account(&account.data, &state.idl) {
+                        if let Some(fields) = state.idl.account_fields(&acc_def.name) {
+                            if let Ok(decoded) = decode_fields(remaining, fields, &type_map) {
+                                let _ = db::insert_account_state(
+                                    &state.pool,
+                                    &state.idl.metadata.name,
+                                    &acc_def.name,
+                                    &pubkey.to_string(),
+                                    0, // slot is purely historical bounds for GPA
+                                    None,
+                                    &decoded,
+                                )
+                                .await;
+                                success_count += 1;
+                            }
+                        }
+                    }
+                }
+                info!(count = success_count, "Successfully synced global account states");
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to poll program accounts");
+            }
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(poll_dur) => {}
+            _ = state.cancel.cancelled() => break,
         }
     }
 }

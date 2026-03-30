@@ -9,7 +9,10 @@ pub struct Config {
     pub rpc_url: String,
     pub wss_url: String,
     pub database_url: String,
-    pub idl_path: String,
+    /// Path to a local IDL JSON file (takes priority over `idl_account`).
+    pub idl_path: Option<String>,
+    /// On-chain IDL account address — fetched and decompressed at startup.
+    pub idl_account: Option<String>,
     pub program_id: Pubkey,
     pub mode: IndexingMode,
     pub api_port: u16,
@@ -37,7 +40,12 @@ impl Config {
         let rpc_url = env_or("RPC_URL", "https://api.mainnet-beta.solana.com");
         let wss_url = env_or("WSS_URL", "wss://api.mainnet-beta.solana.com");
         let database_url = required_env("DATABASE_URL")?;
-        let idl_path = required_env("IDL_PATH")?;
+        let idl_path = std::env::var("IDL_PATH").ok();
+        let idl_account = std::env::var("IDL_ACCOUNT").ok();
+        anyhow::ensure!(
+            idl_path.is_some() || idl_account.is_some(),
+            "At least one of IDL_PATH or IDL_ACCOUNT must be set"
+        );
         let program_id = Pubkey::from_str(&required_env("PROGRAM_ID")?)
             .map_err(|e| anyhow::anyhow!("Invalid PROGRAM_ID: {e}"))?;
 
@@ -75,6 +83,7 @@ impl Config {
             wss_url,
             database_url,
             idl_path,
+            idl_account,
             program_id,
             mode,
             api_port,

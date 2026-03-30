@@ -6,6 +6,9 @@ pub enum IndexerError {
     #[error("RPC error: {0}")]
     Rpc(String),
 
+    #[error("Solana client error: {0}")]
+    SolanaClient(#[from] solana_client::client_error::ClientError),
+
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
 

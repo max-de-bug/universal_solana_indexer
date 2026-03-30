@@ -9,10 +9,14 @@ use crate::config::Config;
 use crate::idl::AnchorIdl;
 use crate::indexer::fetcher::Fetcher;
 use crate::indexer::IndexerState;
+use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_sdk::commitment_config::CommitmentConfig;
+use solana_sdk::pubkey::Pubkey;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
-use tracing::info;
+use tracing::{error, info};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -31,8 +35,10 @@ async fn main() -> anyhow::Result<()> {
     info!("Starting Universal Solana Indexer");
 
     let config = Config::from_env()?;
-    let idl = AnchorIdl::from_file(&config.idl_path)?;
     let pool = db::create_pool(&config.database_url).await?;
+
+    // ---- IDL loading (file → on-chain) --------------------------------------
+    let idl = load_idl(&config).await?;
 
     // ---- Schema initialisation ----------------------------------------------
     db::initialize_schema(&pool, &idl, &idl.metadata.name).await?;
@@ -90,8 +96,8 @@ async fn main() -> anyhow::Result<()> {
         res = indexer_handle => {
             match res {
                 Ok(Ok(())) => info!("Indexer finished"),
-                Ok(Err(e)) => tracing::error!(error = %e, "Indexer error"),
-                Err(e) => tracing::error!(error = %e, "Indexer task panicked"),
+                Ok(Err(e)) => error!(error = %e, "Indexer error"),
+                Err(e) => error!(error = %e, "Indexer task panicked"),
             }
             cancel.cancel();
         }
@@ -103,4 +109,29 @@ async fn main() -> anyhow::Result<()> {
     info!("Shutdown complete");
 
     Ok(())
+}
+
+/// Load IDL: prioritise local file, fall back to on-chain account.
+async fn load_idl(config: &Config) -> anyhow::Result<AnchorIdl> {
+    // 1. Try local file.
+    if let Some(ref path) = config.idl_path {
+        if std::fs::metadata(path).is_ok() {
+            info!(%path, "Loading IDL from file");
+            return AnchorIdl::from_file(path);
+        }
+    }
+
+    // 2. Try on-chain account.
+    if let Some(ref addr) = config.idl_account {
+        let pubkey = Pubkey::from_str(addr)
+            .map_err(|e| anyhow::anyhow!("Invalid IDL_ACCOUNT address: {e}"))?;
+        let rpc = RpcClient::new_with_commitment(
+            config.rpc_url.clone(),
+            CommitmentConfig::confirmed(),
+        );
+        info!(%addr, "Fetching IDL from on-chain account");
+        return AnchorIdl::from_chain(&rpc, &pubkey).await;
+    }
+
+    anyhow::bail!("No IDL source available: set IDL_PATH or IDL_ACCOUNT")
 }

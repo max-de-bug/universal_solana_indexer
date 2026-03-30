@@ -1,6 +1,7 @@
 use crate::error::IndexerError;
-use solana_client::rpc_client::RpcClient;
-use solana_client::rpc_config::{RpcTransactionConfig, RpcTransactionLogsConfig, RpcTransactionLogsFilter};
+use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
+use solana_client::rpc_config::RpcTransactionConfig;
 use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
@@ -10,7 +11,7 @@ use std::str::FromStr;
 use std::time::Duration;
 use tracing::{debug, error, warn};
 
-/// RPC wrapper with automatic retries and exponential backoff.
+/// Async RPC wrapper with automatic retries and exponential backoff.
 pub struct Fetcher {
     rpc: RpcClient,
     max_retries: u32,
@@ -32,7 +33,8 @@ impl Fetcher {
 
     /// Get current slot with retries.
     pub async fn get_slot(&self) -> Result<u64, IndexerError> {
-        self.with_retry("get_slot", || self.rpc.get_slot()).await
+        self.with_retry("get_slot", || self.rpc.get_slot())
+            .await
     }
 
     /// Fetch signatures for a program address, paginated.
@@ -53,7 +55,7 @@ impl Fetcher {
             .transpose()
             .map_err(|e| IndexerError::Rpc(format!("Invalid 'until' signature: {e}")))?;
 
-        let config = solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config {
+        let config = GetConfirmedSignaturesForAddress2Config {
             before: before_sig,
             until: until_sig,
             limit: Some(limit),
@@ -83,8 +85,7 @@ impl Fetcher {
         };
 
         self.with_retry("get_transaction", || {
-            self.rpc
-                .get_transaction_with_config(&signature, config)
+            self.rpc.get_transaction_with_config(&signature, config)
         })
         .await
     }
@@ -100,19 +101,35 @@ impl Fetcher {
             .await
         {
             Ok(data) => Ok(Some(data)),
-            Err(IndexerError::Rpc(msg)) if msg.contains("AccountNotFound") => Ok(None),
+            Err(IndexerError::SolanaClient(ref e))
+                if e.to_string().contains("AccountNotFound") =>
+            {
+                Ok(None)
+            }
+            Err(IndexerError::Rpc(ref msg)) if msg.contains("AccountNotFound") => Ok(None),
             Err(e) => Err(e),
         }
     }
 
-    /// Generic retry wrapper with exponential backoff + jitter.
-    async fn with_retry<F, T>(&self, op: &str, f: F) -> Result<T, IndexerError>
+    /// Fetch all accounts owned by a program.
+    pub async fn get_program_accounts(
+        &self,
+        program: &Pubkey,
+    ) -> Result<Vec<(Pubkey, solana_sdk::account::Account)>, IndexerError> {
+        let pk = *program;
+        self.with_retry("get_program_accounts", || self.rpc.get_program_accounts(&pk))
+            .await
+    }
+
+    /// Generic async retry wrapper with exponential backoff, capped at 30 s.
+    async fn with_retry<F, Fut, T>(&self, op: &str, f: F) -> Result<T, IndexerError>
     where
-        F: Fn() -> Result<T, solana_client::client_error::ClientError>,
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<T, solana_client::client_error::ClientError>>,
     {
         let mut delay = self.initial_delay;
         for attempt in 0..=self.max_retries {
-            match f() {
+            match f().await {
                 Ok(val) => return Ok(val),
                 Err(e) => {
                     if attempt == self.max_retries {
@@ -121,7 +138,6 @@ impl Fetcher {
                     }
                     warn!(%op, attempt, error = %e, retry_in = ?delay, "RPC call failed, retrying");
                     tokio::time::sleep(delay).await;
-                    // Exponential backoff: double delay, cap at 30s.
                     delay = (delay * 2).min(Duration::from_secs(30));
                 }
             }

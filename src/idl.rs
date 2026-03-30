@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::io::Read;
 use tracing::info;
 
 // ---------------------------------------------------------------------------
@@ -161,14 +162,65 @@ impl AnchorIdl {
             }
         }
 
-        info!(
-            name = %idl.metadata.name,
-            instructions = idl.instructions.len(),
-            accounts = idl.accounts.len(),
-            types = idl.types.len(),
-            "Loaded Anchor IDL"
-        );
+        idl.log_summary();
         Ok(idl)
+    }
+
+    /// Fetch an IDL from an on-chain Anchor IDL account, decompress, and parse.
+    pub async fn from_chain(
+        rpc: &solana_client::nonblocking::rpc_client::RpcClient,
+        idl_account: &solana_sdk::pubkey::Pubkey,
+    ) -> anyhow::Result<Self> {
+        use flate2::read::ZlibDecoder;
+
+        info!(%idl_account, "Fetching IDL from on-chain account");
+
+        let account_data = rpc
+            .get_account_data(idl_account)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to fetch IDL account: {e}"))?;
+
+        // Anchor IDL account layout:
+        //   [8B discriminator] [32B authority] [4B data_len LE] [compressed data...]
+        anyhow::ensure!(account_data.len() > 44, "IDL account data too short");
+
+        let data_len = u32::from_le_bytes(account_data[40..44].try_into()?) as usize;
+        let compressed = &account_data[44..44 + data_len.min(account_data.len() - 44)];
+
+        let mut decoder = ZlibDecoder::new(compressed);
+        let mut json_str = String::new();
+        decoder
+            .read_to_string(&mut json_str)
+            .map_err(|e| anyhow::anyhow!("Failed to decompress IDL: {e}"))?;
+
+        info!(json_bytes = json_str.len(), "IDL decompressed from chain");
+
+        let mut idl: Self = serde_json::from_str(&json_str)
+            .map_err(|e| anyhow::anyhow!("Failed to parse on-chain IDL JSON: {e}"))?;
+
+        for ix in &mut idl.instructions {
+            if ix.discriminator.is_empty() {
+                ix.discriminator = compute_instruction_discriminator(&ix.name);
+            }
+        }
+        for acc in &mut idl.accounts {
+            if acc.discriminator.is_empty() {
+                acc.discriminator = compute_account_discriminator(&acc.name);
+            }
+        }
+
+        idl.log_summary();
+        Ok(idl)
+    }
+
+    fn log_summary(&self) {
+        info!(
+            name = %self.metadata.name,
+            instructions = self.instructions.len(),
+            accounts = self.accounts.len(),
+            types = self.types.len(),
+            "Anchor IDL loaded"
+        );
     }
 
     /// Build a lookup of type definitions by name.

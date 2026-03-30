@@ -1,6 +1,6 @@
 use crate::idl::{idl_type_to_sql, AnchorIdl};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use tracing::info;
 
 // ---------------------------------------------------------------------------
@@ -14,6 +14,21 @@ pub async fn create_pool(database_url: &str) -> anyhow::Result<PgPool> {
         .await?;
     info!("Connected to PostgreSQL");
     Ok(pool)
+}
+
+// ---------------------------------------------------------------------------
+// Dedup helper
+// ---------------------------------------------------------------------------
+
+/// Returns true if a transaction with this signature is already indexed.
+pub async fn transaction_exists(pool: &PgPool, signature: &str) -> anyhow::Result<bool> {
+    let row: (bool,) = sqlx::query_as(
+        "SELECT EXISTS(SELECT 1 FROM transactions WHERE signature = $1)",
+    )
+    .bind(signature)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -32,6 +47,10 @@ pub async fn initialize_schema(
     for account_def in &idl.accounts {
         let fields = idl.account_fields(&account_def.name);
         create_account_table(pool, program_name, &account_def.name, fields).await?;
+    }
+
+    for ix_def in &idl.instructions {
+        create_instruction_table(pool, program_name, &ix_def.name, &ix_def.args).await?;
     }
 
     info!(%program_name, "Database schema initialised");
@@ -118,7 +137,7 @@ async fn create_account_table(
     account_name: &str,
     fields: Option<&Vec<crate::idl::IdlField>>,
 ) -> anyhow::Result<()> {
-    let table = sanitize_name(&format!("{program_name}_{account_name}"));
+    let table = format!("\"{}\"" , sanitize_name(&format!("{program_name}_{account_name}")));
 
     let mut cols = vec![
         "id                     BIGSERIAL   PRIMARY KEY".to_string(),
@@ -149,6 +168,37 @@ async fn create_account_table(
     }
 
     info!(%table, "Dynamic account table ready");
+    Ok(())
+}
+
+async fn create_instruction_table(
+    pool: &PgPool,
+    program_name: &str,
+    ix_name: &str,
+    fields: &[crate::idl::IdlField],
+) -> anyhow::Result<()> {
+    let table = format!("\"{}\"" , sanitize_name(&format!("{program_name}_ix_{ix_name}")));
+
+    let mut cols = vec![
+        "id                     BIGSERIAL   PRIMARY KEY".to_string(),
+        "transaction_signature  TEXT        NOT NULL".to_string(),
+        "instruction_index      INTEGER     NOT NULL".to_string(),
+    ];
+
+    for f in fields {
+        let col = sanitize_name(&f.name);
+        let ty = idl_type_to_sql(&f.field_type);
+        cols.push(format!("{col}  {ty}"));
+    }
+
+    cols.push("indexed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()".to_string());
+
+    let ddl = format!("CREATE TABLE IF NOT EXISTS {table} ({})", cols.join(", "));
+    sqlx::query(&ddl).execute(pool).await?;
+
+    let idx = format!("CREATE INDEX IF NOT EXISTS idx_{table}_tx ON {table}(transaction_signature)");
+    sqlx::query(&idx).execute(pool).await?;
+
     Ok(())
 }
 
@@ -272,10 +322,29 @@ pub async fn insert_account_state(
     data: &serde_json::Value,
 ) -> anyhow::Result<()> {
     let table = sanitize_name(&format!("{program_name}_{account_type}"));
+    let obj = match data.as_object() {
+        Some(o) => o,
+        None => return Ok(()),
+    };
+
+    let mut dyn_cols = vec![];
+    for k in obj.keys() {
+        dyn_cols.push(sanitize_name(k));
+    }
+
+    let dyn_selector = if dyn_cols.is_empty() {
+        "".to_string()
+    } else {
+        format!(", {}", dyn_cols.clone().join(", "))
+    };
+
     let sql = format!(
-        "INSERT INTO {table} (pubkey, slot, transaction_signature, data)
-         VALUES ($1, $2, $3, $4)"
+        "INSERT INTO \"{table}\" (pubkey, slot, transaction_signature, data{})
+         SELECT $1, $2, $3, $4{} 
+         FROM jsonb_populate_record(NULL::\"{table}\", $4::jsonb)",
+        dyn_selector, dyn_selector
     );
+
     sqlx::query(&sql)
         .bind(pubkey)
         .bind(slot as i64)
@@ -285,3 +354,53 @@ pub async fn insert_account_state(
         .await?;
     Ok(())
 }
+
+pub async fn insert_dynamic_instruction(
+    pool: &PgPool,
+    program_name: &str,
+    tx_sig: &str,
+    ix_index: i32,
+    ix_name: &str,
+    args: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let table = sanitize_name(&format!("{program_name}_ix_{ix_name}"));
+    
+    let obj = match args.as_object() {
+        Some(o) => o,
+        None => return Ok(()),
+    };
+
+    if obj.is_empty() {
+        let sql = format!(
+            "INSERT INTO \"{table}\" (transaction_signature, instruction_index) VALUES ($1, $2)"
+        );
+        sqlx::query(&sql)
+            .bind(tx_sig)
+            .bind(ix_index)
+            .execute(pool)
+            .await?;
+        return Ok(());
+    }
+
+    let mut dyn_cols = vec![];
+    for k in obj.keys() {
+        dyn_cols.push(sanitize_name(k));
+    }
+
+    let dyn_selector = dyn_cols.join(", ");
+
+    let sql = format!(
+        "INSERT INTO \"{table}\" (transaction_signature, instruction_index, {dyn_selector})
+         SELECT $1, $2, {dyn_selector} 
+         FROM jsonb_populate_record(NULL::\"{table}\", $3::jsonb)"
+    );
+
+    sqlx::query(&sql)
+        .bind(tx_sig)
+        .bind(ix_index)
+        .bind(args)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+

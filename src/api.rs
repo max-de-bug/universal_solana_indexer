@@ -6,7 +6,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use std::sync::Arc;
 use tracing::error;
 
@@ -104,6 +104,75 @@ struct AggBucket {
 }
 
 // ---------------------------------------------------------------------------
+// Typed dynamic query builder — avoids the String-bind-everything anti-pattern
+// ---------------------------------------------------------------------------
+
+/// Accumulates SQL fragments and heterogeneous parameter values.
+struct QueryBuilder {
+    sql: String,
+    param_idx: u32,
+    /// We store boxed closures that bind each value in order.
+    binders: Vec<Box<dyn FnOnce(sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments>) -> sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments> + Send>>,
+}
+
+impl QueryBuilder {
+    fn new(base: &str) -> Self {
+        Self {
+            sql: base.to_string(),
+            param_idx: 1,
+            binders: Vec::new(),
+        }
+    }
+
+    fn push_str(&mut self, fragment: &str) {
+        self.sql.push_str(fragment);
+    }
+
+    fn bind_string(&mut self, clause: &str, value: String) {
+        self.sql.push_str(&clause.replace("{}", &format!("${}", self.param_idx)));
+        self.param_idx += 1;
+        self.binders.push(Box::new(move |q| q.bind(value)));
+    }
+
+    fn bind_i64(&mut self, clause: &str, value: i64) {
+        self.sql.push_str(&clause.replace("{}", &format!("${}", self.param_idx)));
+        self.param_idx += 1;
+        self.binders.push(Box::new(move |q| q.bind(value)));
+    }
+
+    fn bind_bool(&mut self, clause: &str, value: bool) {
+        self.sql.push_str(&clause.replace("{}", &format!("${}", self.param_idx)));
+        self.param_idx += 1;
+        self.binders.push(Box::new(move |q| q.bind(value)));
+    }
+
+    fn finish_with_pagination(mut self, limit: i64, offset: i64, order: &str) -> (String, Vec<Box<dyn FnOnce(sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments>) -> sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments> + Send>>) {
+        self.sql.push_str(&format!(
+            " ORDER BY {order} LIMIT ${} OFFSET ${}",
+            self.param_idx,
+            self.param_idx + 1
+        ));
+        self.binders.push(Box::new(move |q| q.bind(limit)));
+        self.binders.push(Box::new(move |q| q.bind(offset)));
+        (self.sql, self.binders)
+    }
+
+    fn finish(self) -> (String, Vec<Box<dyn FnOnce(sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments>) -> sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments> + Send>>) {
+        (self.sql, self.binders)
+    }
+}
+
+fn apply_binders<'a>(
+    mut query: sqlx::query::Query<'a, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    binders: Vec<Box<dyn FnOnce(sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments>) -> sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments> + Send>>,
+) -> sqlx::query::Query<'a, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    for binder in binders {
+        query = binder(query);
+    }
+    query
+}
+
+// ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
 
@@ -118,52 +187,32 @@ async fn list_transactions(
     let limit = q.limit.unwrap_or(50).min(500);
     let offset = q.offset.unwrap_or(0);
 
-    let mut sql = String::from(
+    let mut qb = QueryBuilder::new(
         "SELECT signature, slot, block_time, success, fee, err_msg, indexed_at
          FROM transactions WHERE 1=1",
     );
-    let mut params: Vec<String> = Vec::new();
-    let mut idx = 1;
 
-    if let Some(ref sig) = q.signature {
-        sql.push_str(&format!(" AND signature = ${idx}"));
-        params.push(sig.clone());
-        idx += 1;
+    if let Some(sig) = q.signature {
+        qb.bind_string(" AND signature = {}", sig);
     }
     if let Some(from) = q.slot_from {
-        sql.push_str(&format!(" AND slot >= ${idx}"));
-        params.push(from.to_string());
-        idx += 1;
+        qb.bind_i64(" AND slot >= {}", from);
     }
     if let Some(to) = q.slot_to {
-        sql.push_str(&format!(" AND slot <= ${idx}"));
-        params.push(to.to_string());
-        idx += 1;
+        qb.bind_i64(" AND slot <= {}", to);
     }
     if let Some(success) = q.success {
-        sql.push_str(&format!(" AND success = ${idx}"));
-        params.push(success.to_string());
-        idx += 1;
+        qb.bind_bool(" AND success = {}", success);
     }
-    sql.push_str(&format!(
-        " ORDER BY slot DESC LIMIT ${idx} OFFSET ${}",
-        idx + 1
-    ));
-    params.push(limit.to_string());
-    params.push(offset.to_string());
 
-    // Build dynamic query using raw SQL with indexed parameters.
-    let mut query = sqlx::query(&sql);
-    for p in &params {
-        query = query.bind(p);
-    }
+    let (sql, binders) = qb.finish_with_pagination(limit, offset, "slot DESC");
+    let query = apply_binders(sqlx::query(&sql), binders);
 
     match query.fetch_all(&state.pool).await {
         Ok(rows) => {
             let results: Vec<serde_json::Value> = rows
                 .iter()
                 .map(|r| {
-                    use sqlx::Row;
                     serde_json::json!({
                         "signature": r.get::<String, _>("signature"),
                         "slot": r.get::<i64, _>("slot"),
@@ -191,46 +240,29 @@ async fn list_instructions(
     let limit = q.limit.unwrap_or(50).min(500);
     let offset = q.offset.unwrap_or(0);
 
-    let mut sql = String::from(
+    let mut qb = QueryBuilder::new(
         "SELECT id, transaction_signature, instruction_index, instruction_name, program_id, args, accounts, indexed_at
          FROM instructions WHERE 1=1",
     );
-    let mut params: Vec<String> = Vec::new();
-    let mut idx = 1;
 
-    if let Some(ref name) = q.name {
-        sql.push_str(&format!(" AND instruction_name = ${idx}"));
-        params.push(name.clone());
-        idx += 1;
+    if let Some(name) = q.name {
+        qb.bind_string(" AND instruction_name = {}", name);
     }
-    if let Some(ref tx) = q.transaction_signature {
-        sql.push_str(&format!(" AND transaction_signature = ${idx}"));
-        params.push(tx.clone());
-        idx += 1;
+    if let Some(tx) = q.transaction_signature {
+        qb.bind_string(" AND transaction_signature = {}", tx);
     }
-    if let Some(ref pid) = q.program_id {
-        sql.push_str(&format!(" AND program_id = ${idx}"));
-        params.push(pid.clone());
-        idx += 1;
+    if let Some(pid) = q.program_id {
+        qb.bind_string(" AND program_id = {}", pid);
     }
-    sql.push_str(&format!(
-        " ORDER BY id DESC LIMIT ${idx} OFFSET ${}",
-        idx + 1
-    ));
-    params.push(limit.to_string());
-    params.push(offset.to_string());
 
-    let mut query = sqlx::query(&sql);
-    for p in &params {
-        query = query.bind(p);
-    }
+    let (sql, binders) = qb.finish_with_pagination(limit, offset, "id DESC");
+    let query = apply_binders(sqlx::query(&sql), binders);
 
     match query.fetch_all(&state.pool).await {
         Ok(rows) => {
             let results: Vec<serde_json::Value> = rows
                 .iter()
                 .map(|r| {
-                    use sqlx::Row;
                     serde_json::json!({
                         "id": r.get::<i64, _>("id"),
                         "transaction_signature": r.get::<String, _>("transaction_signature"),
@@ -257,7 +289,6 @@ async fn list_accounts(
     Path(account_type): Path<String>,
     Query(q): Query<AccountQuery>,
 ) -> impl IntoResponse {
-    let table = sanitize_name(&format!("{}_{}", state.program_name, account_type));
     if !state.account_types.contains(&account_type) {
         return (
             StatusCode::NOT_FOUND,
@@ -266,43 +297,30 @@ async fn list_accounts(
             .into_response();
     }
 
+    let table = sanitize_name(&format!("{}_{}", state.program_name, account_type));
     let limit = q.limit.unwrap_or(50).min(500);
     let offset = q.offset.unwrap_or(0);
 
-    let mut sql = format!("SELECT * FROM {table} WHERE 1=1");
-    let mut params: Vec<String> = Vec::new();
-    let mut idx = 1;
+    let mut qb = QueryBuilder::new(&format!(
+        "SELECT pubkey, slot, transaction_signature, data, indexed_at FROM \"{}\" WHERE 1=1",
+        table
+    ));
 
-    if let Some(ref pk) = q.pubkey {
-        sql.push_str(&format!(" AND pubkey = ${idx}"));
-        params.push(pk.clone());
-        idx += 1;
+    if let Some(pk) = q.pubkey {
+        qb.bind_string(" AND pubkey = {}", pk);
     }
     if let Some(from) = q.slot_from {
-        sql.push_str(&format!(" AND slot >= ${idx}"));
-        params.push(from.to_string());
-        idx += 1;
+        qb.bind_i64(" AND slot >= {}", from);
     }
     if let Some(to) = q.slot_to {
-        sql.push_str(&format!(" AND slot <= ${idx}"));
-        params.push(to.to_string());
-        idx += 1;
+        qb.bind_i64(" AND slot <= {}", to);
     }
-    sql.push_str(&format!(
-        " ORDER BY slot DESC LIMIT ${idx} OFFSET ${}",
-        idx + 1
-    ));
-    params.push(limit.to_string());
-    params.push(offset.to_string());
 
-    let mut query = sqlx::query(&sql);
-    for p in &params {
-        query = query.bind(p);
-    }
+    let (sql, binders) = qb.finish_with_pagination(limit, offset, "slot DESC");
+    let query = apply_binders(sqlx::query(&sql), binders);
 
     match query.fetch_all(&state.pool).await {
         Ok(rows) => {
-            use sqlx::Row;
             let results: Vec<serde_json::Value> = rows
                 .iter()
                 .map(|r| {
@@ -375,42 +393,30 @@ async fn instruction_aggregation(
         _ => "hour",
     };
 
-    let mut sql = format!(
+    let mut qb = QueryBuilder::new(&format!(
         "SELECT date_trunc('{trunc}', i.indexed_at) as period,
                 i.instruction_name,
                 COUNT(*) as cnt
          FROM instructions i WHERE 1=1"
-    );
-    let mut params: Vec<String> = Vec::new();
-    let mut idx = 1;
-
-    if let Some(ref name) = q.name {
-        sql.push_str(&format!(" AND i.instruction_name = ${idx}"));
-        params.push(name.clone());
-        idx += 1;
-    }
-    if let Some(ref from) = q.from_time {
-        sql.push_str(&format!(" AND i.indexed_at >= ${idx}::timestamptz"));
-        params.push(from.clone());
-        idx += 1;
-    }
-    if let Some(ref to) = q.to_time {
-        sql.push_str(&format!(" AND i.indexed_at <= ${idx}::timestamptz"));
-        params.push(to.clone());
-        idx += 1;
-    }
-    sql.push_str(&format!(
-        " GROUP BY period, i.instruction_name ORDER BY period DESC LIMIT 1000"
     ));
 
-    let mut query = sqlx::query(&sql);
-    for p in &params {
-        query = query.bind(p);
+    if let Some(name) = q.name {
+        qb.bind_string(" AND i.instruction_name = {}", name);
     }
+    if let Some(from) = q.from_time {
+        qb.bind_string(" AND i.indexed_at >= {}::timestamptz", from);
+    }
+    if let Some(to) = q.to_time {
+        qb.bind_string(" AND i.indexed_at <= {}::timestamptz", to);
+    }
+
+    qb.push_str(" GROUP BY period, i.instruction_name ORDER BY period DESC LIMIT 1000");
+
+    let (sql, binders) = qb.finish();
+    let query = apply_binders(sqlx::query(&sql), binders);
 
     match query.fetch_all(&state.pool).await {
         Ok(rows) => {
-            use sqlx::Row;
             let results: Vec<AggBucket> = rows
                 .iter()
                 .map(|r| AggBucket {
