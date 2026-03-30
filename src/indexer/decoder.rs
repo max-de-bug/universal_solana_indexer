@@ -1,4 +1,4 @@
-use crate::idl::{AnchorIdl, IdlField, IdlType, IdlTypeDefTy};
+use crate::idl::{AnchorIdl, IdlAccountDef, IdlField, IdlInstruction, IdlType, IdlTypeDef, IdlTypeDefTy};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use tracing::warn;
@@ -11,7 +11,7 @@ use tracing::warn;
 pub fn match_instruction<'a>(
     data: &'a [u8],
     idl: &'a AnchorIdl,
-) -> Option<(&'a crate::idl::IdlInstruction, &'a [u8])> {
+) -> Option<(&'a IdlInstruction, &'a [u8])> {
     if data.len() < 8 {
         return None;
     }
@@ -26,7 +26,7 @@ pub fn match_instruction<'a>(
 pub fn match_account<'a>(
     data: &'a [u8],
     idl: &'a AnchorIdl,
-) -> Option<(&'a crate::idl::IdlAccountDef, &'a [u8])> {
+) -> Option<(&'a IdlAccountDef, &'a [u8])> {
     if data.len() < 8 {
         return None;
     }
