@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Read;
 use tracing::info;
+use crate::error::IndexerError;
 
 // ---------------------------------------------------------------------------
 // Anchor IDL data model (supports both v0.29 legacy and v0.30+ formats)
@@ -144,11 +145,11 @@ pub struct IdlErrorDef {
 
 impl AnchorIdl {
     /// Load and parse an Anchor IDL JSON file from disk.
-    pub fn from_file(path: &str) -> anyhow::Result<Self> {
+    pub fn from_file(path: &str) -> Result<Self, IndexerError> {
         let content = std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("Failed to read IDL at {path}: {e}"))?;
+            .map_err(|e| IndexerError::IdlParse(format!("Failed to read IDL at {path}: {e}")))?;
         let mut idl: Self = serde_json::from_str(&content)
-            .map_err(|e| anyhow::anyhow!("Failed to parse IDL JSON: {e}"))?;
+            .map_err(|e| IndexerError::IdlParse(format!("Failed to parse IDL JSON: {e}")))?;
 
         // Back-fill discriminators for IDLs that do not embed them (legacy).
         for ix in &mut idl.instructions {
@@ -170,7 +171,7 @@ impl AnchorIdl {
     pub async fn from_chain(
         rpc: &solana_client::nonblocking::rpc_client::RpcClient,
         idl_account: &solana_sdk::pubkey::Pubkey,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self, IndexerError> {
         use flate2::read::ZlibDecoder;
 
         info!(%idl_account, "Fetching IDL from on-chain account");
@@ -178,25 +179,27 @@ impl AnchorIdl {
         let account_data = rpc
             .get_account_data(idl_account)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to fetch IDL account: {e}"))?;
+            .map_err(|e| IndexerError::IdlParse(format!("Failed to fetch IDL account: {e}")))?;
 
         // Anchor IDL account layout:
         //   [8B discriminator] [32B authority] [4B data_len LE] [compressed data...]
-        anyhow::ensure!(account_data.len() > 44, "IDL account data too short");
+        if account_data.len() <= 44 {
+            return Err(IndexerError::IdlParse("IDL account data too short".to_string()));
+        }
 
-        let data_len = u32::from_le_bytes(account_data[40..44].try_into()?) as usize;
+        let data_len = u32::from_le_bytes(account_data[40..44].try_into().map_err(|e| IndexerError::IdlParse(format!("Bad len offset: {e}")))?) as usize;
         let compressed = &account_data[44..44 + data_len.min(account_data.len() - 44)];
 
         let mut decoder = ZlibDecoder::new(compressed);
         let mut json_str = String::new();
         decoder
             .read_to_string(&mut json_str)
-            .map_err(|e| anyhow::anyhow!("Failed to decompress IDL: {e}"))?;
+            .map_err(|e| IndexerError::IdlParse(format!("Failed to decompress IDL: {e}")))?;
 
         info!(json_bytes = json_str.len(), "IDL decompressed from chain");
 
         let mut idl: Self = serde_json::from_str(&json_str)
-            .map_err(|e| anyhow::anyhow!("Failed to parse on-chain IDL JSON: {e}"))?;
+            .map_err(|e| IndexerError::IdlParse(format!("Failed to parse on-chain IDL JSON: {e}")))?;
 
         for ix in &mut idl.instructions {
             if ix.discriminator.is_empty() {

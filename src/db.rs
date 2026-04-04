@@ -1,13 +1,14 @@
+use crate::error::IndexerError;
 use crate::idl::{idl_type_to_sql, AnchorIdl};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 use tracing::info;
 
 // ---------------------------------------------------------------------------
 // Pool creation
 // ---------------------------------------------------------------------------
 
-pub async fn create_pool(database_url: &str) -> anyhow::Result<PgPool> {
+pub async fn create_pool(database_url: &str) -> Result<PgPool, IndexerError> {
     let pool = PgPoolOptions::new()
         .max_connections(10)
         .connect(database_url)
@@ -21,12 +22,15 @@ pub async fn create_pool(database_url: &str) -> anyhow::Result<PgPool> {
 // ---------------------------------------------------------------------------
 
 /// Returns true if a transaction with this signature is already indexed.
-pub async fn transaction_exists(pool: &PgPool, signature: &str) -> anyhow::Result<bool> {
+pub async fn transaction_exists(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
+    signature: &str,
+) -> Result<bool, IndexerError> {
     let row: (bool,) = sqlx::query_as(
         "SELECT EXISTS(SELECT 1 FROM transactions WHERE signature = $1)",
     )
     .bind(signature)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
     Ok(row.0)
 }
@@ -39,7 +43,7 @@ pub async fn initialize_schema(
     pool: &PgPool,
     idl: &AnchorIdl,
     program_name: &str,
-) -> anyhow::Result<()> {
+) -> Result<(), IndexerError> {
     create_sync_state_table(pool).await?;
     create_transactions_table(pool).await?;
     create_instructions_table(pool).await?;
@@ -59,7 +63,7 @@ pub async fn initialize_schema(
 
 // ---- Core tables ----------------------------------------------------------
 
-async fn create_sync_state_table(pool: &PgPool) -> anyhow::Result<()> {
+async fn create_sync_state_table(pool: &PgPool) -> Result<(), IndexerError> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS sync_state (
             id            SERIAL      PRIMARY KEY,
@@ -74,7 +78,7 @@ async fn create_sync_state_table(pool: &PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn create_transactions_table(pool: &PgPool) -> anyhow::Result<()> {
+async fn create_transactions_table(pool: &PgPool) -> Result<(), IndexerError> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS transactions (
             id          BIGSERIAL   PRIMARY KEY,
@@ -100,7 +104,7 @@ async fn create_transactions_table(pool: &PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn create_instructions_table(pool: &PgPool) -> anyhow::Result<()> {
+async fn create_instructions_table(pool: &PgPool) -> Result<(), IndexerError> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS instructions (
             id                     BIGSERIAL   PRIMARY KEY,
@@ -136,7 +140,7 @@ async fn create_account_table(
     program_name: &str,
     account_name: &str,
     fields: Option<&Vec<crate::idl::IdlField>>,
-) -> anyhow::Result<()> {
+) -> Result<(), IndexerError> {
     let table = format!("\"{}\"" , sanitize_name(&format!("{program_name}_{account_name}")));
 
     let mut cols = vec![
@@ -176,7 +180,7 @@ async fn create_instruction_table(
     program_name: &str,
     ix_name: &str,
     fields: &[crate::idl::IdlField],
-) -> anyhow::Result<()> {
+) -> Result<(), IndexerError> {
     let table = format!("\"{}\"" , sanitize_name(&format!("{program_name}_ix_{ix_name}")));
 
     let mut cols = vec![
@@ -222,7 +226,7 @@ pub fn sanitize_name(name: &str) -> String {
 pub async fn get_last_processed(
     pool: &PgPool,
     program_id: &str,
-) -> anyhow::Result<Option<(u64, Option<String>)>> {
+) -> Result<Option<(u64, Option<String>)>, IndexerError> {
     let row: Option<(i64, Option<String>)> = sqlx::query_as(
         "SELECT last_slot, last_signature FROM sync_state WHERE program_id = $1",
     )
@@ -238,7 +242,7 @@ pub async fn update_sync_state(
     program_id: &str,
     slot: u64,
     signature: Option<&str>,
-) -> anyhow::Result<()> {
+) -> Result<(), IndexerError> {
     sqlx::query(
         "INSERT INTO sync_state (program_id, last_slot, last_signature, updated_at)
          VALUES ($1, $2, $3, NOW())
@@ -260,14 +264,14 @@ pub async fn update_sync_state(
 // ---------------------------------------------------------------------------
 
 pub async fn insert_transaction(
-    pool: &PgPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
     signature: &str,
     slot: u64,
     block_time: Option<i64>,
     success: bool,
     fee: Option<u64>,
     err_msg: Option<&str>,
-) -> anyhow::Result<()> {
+) -> Result<(), IndexerError> {
     sqlx::query(
         "INSERT INTO transactions (signature, slot, block_time, success, fee, err_msg)
          VALUES ($1, $2, to_timestamp($3), $4, $5, $6)
@@ -279,13 +283,13 @@ pub async fn insert_transaction(
     .bind(success)
     .bind(fee.map(|f| f as i64))
     .bind(err_msg)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
 
 pub async fn insert_instruction(
-    pool: &PgPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
     tx_sig: &str,
     ix_index: i32,
     ix_name: &str,
@@ -293,7 +297,7 @@ pub async fn insert_instruction(
     args: &serde_json::Value,
     accounts: &serde_json::Value,
     raw_data: Option<&[u8]>,
-) -> anyhow::Result<()> {
+) -> Result<(), IndexerError> {
     sqlx::query(
         "INSERT INTO instructions
             (transaction_signature, instruction_index, instruction_name, program_id, args, accounts, raw_data)
@@ -307,20 +311,20 @@ pub async fn insert_instruction(
     .bind(args)
     .bind(accounts)
     .bind(raw_data)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
 
 pub async fn insert_account_state(
-    pool: &PgPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
     program_name: &str,
     account_type: &str,
     pubkey: &str,
-    slot: u64,
+    slot: Option<u64>,
     tx_sig: Option<&str>,
     data: &serde_json::Value,
-) -> anyhow::Result<()> {
+) -> Result<(), IndexerError> {
     let table = sanitize_name(&format!("{program_name}_{account_type}"));
     let obj = match data.as_object() {
         Some(o) => o,
@@ -347,22 +351,22 @@ pub async fn insert_account_state(
 
     sqlx::query(&sql)
         .bind(pubkey)
-        .bind(slot as i64)
+        .bind(slot.map(|s| s as i64))
         .bind(tx_sig)
         .bind(data)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(())
 }
 
 pub async fn insert_dynamic_instruction(
-    pool: &PgPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
     program_name: &str,
     tx_sig: &str,
     ix_index: i32,
     ix_name: &str,
     args: &serde_json::Value,
-) -> anyhow::Result<()> {
+) -> Result<(), IndexerError> {
     let table = sanitize_name(&format!("{program_name}_ix_{ix_name}"));
     
     let obj = match args.as_object() {
@@ -377,7 +381,7 @@ pub async fn insert_dynamic_instruction(
         sqlx::query(&sql)
             .bind(tx_sig)
             .bind(ix_index)
-            .execute(pool)
+            .execute(executor)
             .await?;
         return Ok(());
     }
@@ -399,7 +403,7 @@ pub async fn insert_dynamic_instruction(
         .bind(tx_sig)
         .bind(ix_index)
         .bind(args)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(())
 }

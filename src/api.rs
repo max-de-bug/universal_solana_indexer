@@ -107,12 +107,18 @@ struct AggBucket {
 // Typed dynamic query builder — avoids the String-bind-everything anti-pattern
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
+enum Param {
+    String(String),
+    I64(i64),
+    Bool(bool),
+}
+
 /// Accumulates SQL fragments and heterogeneous parameter values.
 struct QueryBuilder {
     sql: String,
     param_idx: u32,
-    /// We store boxed closures that bind each value in order.
-    binders: Vec<Box<dyn FnOnce(sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments>) -> sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments> + Send>>,
+    params: Vec<Param>,
 }
 
 impl QueryBuilder {
@@ -120,7 +126,7 @@ impl QueryBuilder {
         Self {
             sql: base.to_string(),
             param_idx: 1,
-            binders: Vec::new(),
+            params: Vec::new(),
         }
     }
 
@@ -131,43 +137,56 @@ impl QueryBuilder {
     fn bind_string(&mut self, clause: &str, value: String) {
         self.sql.push_str(&clause.replace("{}", &format!("${}", self.param_idx)));
         self.param_idx += 1;
-        self.binders.push(Box::new(move |q| q.bind(value)));
+        self.params.push(Param::String(value));
     }
 
     fn bind_i64(&mut self, clause: &str, value: i64) {
         self.sql.push_str(&clause.replace("{}", &format!("${}", self.param_idx)));
         self.param_idx += 1;
-        self.binders.push(Box::new(move |q| q.bind(value)));
+        self.params.push(Param::I64(value));
     }
 
     fn bind_bool(&mut self, clause: &str, value: bool) {
         self.sql.push_str(&clause.replace("{}", &format!("${}", self.param_idx)));
         self.param_idx += 1;
-        self.binders.push(Box::new(move |q| q.bind(value)));
+        self.params.push(Param::Bool(value));
     }
 
-    fn finish_with_pagination(mut self, limit: i64, offset: i64, order: &str) -> (String, Vec<Box<dyn FnOnce(sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments>) -> sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments> + Send>>) {
+    fn build_count(&self) -> (String, Vec<Param>) {
+        let count_sql = if let Some(from_idx) = self.sql.find(" FROM ") {
+            format!("SELECT COUNT(*) {}", &self.sql[from_idx..])
+        } else {
+            self.sql.clone()
+        };
+        (count_sql, self.params.clone())
+    }
+
+    fn finish_with_pagination(mut self, limit: i64, offset: i64, order: &str) -> (String, Vec<Param>) {
         self.sql.push_str(&format!(
             " ORDER BY {order} LIMIT ${} OFFSET ${}",
             self.param_idx,
             self.param_idx + 1
         ));
-        self.binders.push(Box::new(move |q| q.bind(limit)));
-        self.binders.push(Box::new(move |q| q.bind(offset)));
-        (self.sql, self.binders)
+        self.params.push(Param::I64(limit));
+        self.params.push(Param::I64(offset));
+        (self.sql, self.params)
     }
 
-    fn finish(self) -> (String, Vec<Box<dyn FnOnce(sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments>) -> sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments> + Send>>) {
-        (self.sql, self.binders)
+    fn finish(self) -> (String, Vec<Param>) {
+        (self.sql, self.params)
     }
 }
 
-fn apply_binders<'a>(
+fn apply_params<'a>(
     mut query: sqlx::query::Query<'a, sqlx::Postgres, sqlx::postgres::PgArguments>,
-    binders: Vec<Box<dyn FnOnce(sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments>) -> sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments> + Send>>,
+    params: Vec<Param>,
 ) -> sqlx::query::Query<'a, sqlx::Postgres, sqlx::postgres::PgArguments> {
-    for binder in binders {
-        query = binder(query);
+    for param in params {
+        query = match param {
+            Param::String(s) => query.bind(s),
+            Param::I64(i) => query.bind(i),
+            Param::Bool(b) => query.bind(b),
+        };
     }
     query
 }
@@ -205,8 +224,14 @@ async fn list_transactions(
         qb.bind_bool(" AND success = {}", success);
     }
 
-    let (sql, binders) = qb.finish_with_pagination(limit, offset, "slot DESC");
-    let query = apply_binders(sqlx::query(&sql), binders);
+    let (count_sql, count_params) = qb.build_count();
+    let total_count: i64 = apply_params(sqlx::query_scalar(&count_sql), count_params)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(0);
+
+    let (sql, params) = qb.finish_with_pagination(limit, offset, "slot DESC");
+    let query = apply_params(sqlx::query(&sql), params);
 
     match query.fetch_all(&state.pool).await {
         Ok(rows) => {
@@ -224,7 +249,13 @@ async fn list_transactions(
                     })
                 })
                 .collect();
-            Json(serde_json::json!({ "data": results, "count": results.len() })).into_response()
+            Json(serde_json::json!({ 
+                "data": results,
+                "total": total_count,
+                "limit": limit,
+                "offset": offset,
+                "has_next": offset + limit < total_count
+            })).into_response()
         }
         Err(e) => {
             error!(error = %e, "Transaction query failed");
@@ -255,8 +286,14 @@ async fn list_instructions(
         qb.bind_string(" AND program_id = {}", pid);
     }
 
-    let (sql, binders) = qb.finish_with_pagination(limit, offset, "id DESC");
-    let query = apply_binders(sqlx::query(&sql), binders);
+    let (count_sql, count_params) = qb.build_count();
+    let total_count: i64 = apply_params(sqlx::query_scalar(&count_sql), count_params)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(0);
+
+    let (sql, params) = qb.finish_with_pagination(limit, offset, "id DESC");
+    let query = apply_params(sqlx::query(&sql), params);
 
     match query.fetch_all(&state.pool).await {
         Ok(rows) => {
@@ -275,7 +312,13 @@ async fn list_instructions(
                     })
                 })
                 .collect();
-            Json(serde_json::json!({ "data": results, "count": results.len() })).into_response()
+            Json(serde_json::json!({ 
+                "data": results,
+                "total": total_count,
+                "limit": limit,
+                "offset": offset,
+                "has_next": offset + limit < total_count
+            })).into_response()
         }
         Err(e) => {
             error!(error = %e, "Instruction query failed");
@@ -316,8 +359,14 @@ async fn list_accounts(
         qb.bind_i64(" AND slot <= {}", to);
     }
 
-    let (sql, binders) = qb.finish_with_pagination(limit, offset, "slot DESC");
-    let query = apply_binders(sqlx::query(&sql), binders);
+    let (count_sql, count_params) = qb.build_count();
+    let total_count: i64 = apply_params(sqlx::query_scalar(&count_sql), count_params)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(0);
+
+    let (sql, params) = qb.finish_with_pagination(limit, offset, "slot DESC");
+    let query = apply_params(sqlx::query(&sql), params);
 
     match query.fetch_all(&state.pool).await {
         Ok(rows) => {
@@ -333,7 +382,13 @@ async fn list_accounts(
                     })
                 })
                 .collect();
-            Json(serde_json::json!({ "data": results, "count": results.len() })).into_response()
+            Json(serde_json::json!({ 
+                "data": results,
+                "total": total_count,
+                "limit": limit,
+                "offset": offset,
+                "has_next": offset + limit < total_count
+            })).into_response()
         }
         Err(e) => {
             error!(error = %e, "Account query failed");
@@ -412,8 +467,8 @@ async fn instruction_aggregation(
 
     qb.push_str(" GROUP BY period, i.instruction_name ORDER BY period DESC LIMIT 1000");
 
-    let (sql, binders) = qb.finish();
-    let query = apply_binders(sqlx::query(&sql), binders);
+    let (sql, params) = qb.finish();
+    let query = apply_params(sqlx::query(&sql), params);
 
     match query.fetch_all(&state.pool).await {
         Ok(rows) => {

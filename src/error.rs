@@ -29,4 +29,7 @@ pub enum IndexerError {
 
     #[error("Max retries ({0}) exhausted")]
     RetriesExhausted(u32),
+
+    #[error(transparent)]
+    Anyhow(#[from] anyhow::Error),
 }

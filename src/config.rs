@@ -20,6 +20,8 @@ pub struct Config {
     pub max_retries: u32,
     pub initial_retry_delay_ms: u64,
     pub poll_interval_ms: u64,
+    /// Number of transactions to process concurrently during batch/backfill.
+    pub batch_concurrency: usize,
 }
 
 /// Determines how the indexer processes data.
@@ -78,6 +80,7 @@ impl Config {
         let max_retries = env_or("MAX_RETRIES", "5").parse()?;
         let initial_retry_delay_ms = env_or("INITIAL_RETRY_DELAY_MS", "500").parse()?;
         let poll_interval_ms = env_or("POLL_INTERVAL_MS", "2000").parse()?;
+        let batch_concurrency = env_or("BATCH_CONCURRENCY", "5").parse()?;
 
         let cfg = Self {
             rpc_urls,
@@ -92,9 +95,10 @@ impl Config {
             max_retries,
             initial_retry_delay_ms,
             poll_interval_ms,
+            batch_concurrency,
         };
 
-        info!(?cfg.mode, %cfg.program_id, %cfg.api_port, "Configuration loaded");
+        info!(?cfg.mode, %cfg.program_id, %cfg.api_port, con = cfg.batch_concurrency, "Configuration loaded");
         Ok(cfg)
     }
 }
