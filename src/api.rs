@@ -191,6 +191,20 @@ fn apply_params<'a>(
     query
 }
 
+fn apply_params_scalar<'a, T>(
+    mut query: sqlx::query::QueryScalar<'a, sqlx::Postgres, T, sqlx::postgres::PgArguments>,
+    params: Vec<Param>,
+) -> sqlx::query::QueryScalar<'a, sqlx::Postgres, T, sqlx::postgres::PgArguments> {
+    for param in params {
+        query = match param {
+            Param::String(s) => query.bind(s),
+            Param::I64(i) => query.bind(i),
+            Param::Bool(b) => query.bind(b),
+        };
+    }
+    query
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -225,7 +239,7 @@ async fn list_transactions(
     }
 
     let (count_sql, count_params) = qb.build_count();
-    let total_count: i64 = apply_params(sqlx::query_scalar(&count_sql), count_params)
+    let total_count: i64 = apply_params_scalar(sqlx::query_scalar(&count_sql), count_params)
         .fetch_one(&state.pool)
         .await
         .unwrap_or(0);
@@ -287,7 +301,7 @@ async fn list_instructions(
     }
 
     let (count_sql, count_params) = qb.build_count();
-    let total_count: i64 = apply_params(sqlx::query_scalar(&count_sql), count_params)
+    let total_count: i64 = apply_params_scalar(sqlx::query_scalar(&count_sql), count_params)
         .fetch_one(&state.pool)
         .await
         .unwrap_or(0);
@@ -360,7 +374,7 @@ async fn list_accounts(
     }
 
     let (count_sql, count_params) = qb.build_count();
-    let total_count: i64 = apply_params(sqlx::query_scalar(&count_sql), count_params)
+    let total_count: i64 = apply_params_scalar(sqlx::query_scalar(&count_sql), count_params)
         .fetch_one(&state.pool)
         .await
         .unwrap_or(0);

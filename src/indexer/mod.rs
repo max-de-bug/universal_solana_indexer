@@ -7,22 +7,18 @@ use crate::error::IndexerError;
 use crate::idl::AnchorIdl;
 use crate::indexer::decoder::{decode_fields, match_account, match_instruction};
 use crate::indexer::fetcher::Fetcher;
-use anyhow::Context;
 use serde_json::json;
 use futures_util::StreamExt;
 use solana_client::nonblocking::pubsub_client::PubsubClient;
 use solana_client::rpc_config::{RpcTransactionLogsConfig, RpcTransactionLogsFilter};
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
-use solana_transaction_status::{
-    EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction, UiInnerInstructions,
-    UiInstruction,
-};
+use solana_transaction_status::{EncodedTransaction, UiInnerInstructions, UiInstruction};
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Shared state passed into the indexer.
 pub struct IndexerState {
@@ -57,7 +53,7 @@ pub async fn run(state: Arc<IndexerState>) -> anyhow::Result<()> {
         poller_handle.abort();
     }
     
-    res
+    Ok(res?)
 }
 
 // ---------------------------------------------------------------------------
@@ -95,19 +91,17 @@ async fn run_batch_slots(
             break;
         }
 
-        let mut reached_start = false;
+        let last_sig_info = sigs.last().cloned();
+        let reached_start = last_sig_info.as_ref().map_or(false, |s| s.slot < start_slot);
 
         let futures = sigs.into_iter().filter_map(|sig_info| {
             let slot = sig_info.slot;
-            if slot < start_slot {
-                reached_start = true;
-                None
-            } else if slot > end_slot {
+            if slot < start_slot || slot > end_slot {
                 None
             } else {
                 let state_ref = state.clone();
+                let sig = sig_info.signature; // Now owned
                 Some(async move {
-                    let sig = sig_info.signature.clone();
                     let res = process_signature(&state_ref, &sig).await;
                     (sig, slot, res)
                 })
@@ -138,11 +132,9 @@ async fn run_batch_slots(
             return Ok(());
         }
 
-        // Just use the last one for pagination
-        // Actually, we consumed `sigs`. We need to save the last signature before we consume it.
-        // Wait, since we collected or iterated, we can't easily get the last one unless we peeked.
-        // Let's just fetch it before into_iter().
-        // Handled below.
+        if let Some(oldest) = last_sig_info {
+            before = Some(oldest.signature);
+        }
     }
 
     info!(%total, "Batch slot indexing finished");
@@ -254,10 +246,10 @@ async fn run_realtime(state: Arc<IndexerState>) -> Result<(), IndexerError> {
                         Some(log) => {
                             let sig = log.value.signature;
                             match process_signature(&state, &sig).await {
-                                Err(e) => warn!(%sig, error = %e, "Failed to process WSS tx"),
                                 Ok(slot) => {
                                     let _ = db::update_sync_state(&state.pool, &program_str, slot, Some(&sig)).await;
                                 }
+                                Err(e) => warn!(%sig, error = %e, "Failed to process WSS tx"),
                             }
                         }
                         None => {
@@ -298,12 +290,15 @@ async fn backfill(state: &IndexerState, until: Option<&str>) -> Result<(), Index
         }
 
         let concurrency = state.config.batch_concurrency;
-        let mut stream = futures_util::stream::iter(sigs.iter().rev())
+        let newest_sig_info = sigs.first().cloned();
+        let oldest_sig_info = sigs.last().cloned();
+
+        let mut stream = futures_util::stream::iter(sigs.into_iter().rev())
             .map(|sig_info| {
                 let state_ref = state;
                 async move {
-                    let sig = &sig_info.signature;
-                    let res = process_signature(state_ref, sig).await;
+                    let sig = sig_info.signature;
+                    let res = process_signature(&state_ref, &sig).await;
                     (sig, res)
                 }
             })
@@ -317,10 +312,10 @@ async fn backfill(state: &IndexerState, until: Option<&str>) -> Result<(), Index
         }
 
         let prog_str = state.config.program_id.to_string();
-        if let Some(oldest) = sigs.last() {
-            before = Some(oldest.signature.clone());
+        if let Some(oldest) = oldest_sig_info {
+            before = Some(oldest.signature);
         }
-        if let Some(newest) = sigs.first() {
+        if let Some(newest) = newest_sig_info {
             db::update_sync_state(
                 &state.pool,
                 &prog_str,
@@ -584,7 +579,7 @@ async fn try_decode_account(
                         &state.idl.metadata.name,
                         &acc_def.name,
                         &pubkey.to_string(),
-                        slot,
+                        Some(slot),
                         Some(tx_sig),
                         &decoded,
                     )
@@ -629,7 +624,7 @@ async fn run_account_poller(state: Arc<IndexerState>) {
                                     &state.idl.metadata.name,
                                     &acc_def.name,
                                     &pubkey.to_string(),
-                                    0, // slot is purely historical bounds for GPA
+                                    Some(0), // slot is purely historical bounds for GPA
                                     None,
                                     &decoded,
                                 )

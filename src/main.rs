@@ -118,7 +118,7 @@ async fn load_idl(config: &Config) -> anyhow::Result<AnchorIdl> {
     if let Some(ref path) = config.idl_path {
         if std::fs::metadata(path).is_ok() {
             info!(%path, "Loading IDL from file");
-            return AnchorIdl::from_file(path);
+            return Ok(AnchorIdl::from_file(path)?);
         }
     }
 
@@ -131,7 +131,7 @@ async fn load_idl(config: &Config) -> anyhow::Result<AnchorIdl> {
             CommitmentConfig::confirmed(),
         );
         info!(%addr, "Fetching IDL from on-chain account");
-        return AnchorIdl::from_chain(&rpc, &pubkey).await;
+        return Ok(AnchorIdl::from_chain(&rpc, &pubkey).await?);
     }
 
     anyhow::bail!("No IDL source available: set IDL_PATH or IDL_ACCOUNT")

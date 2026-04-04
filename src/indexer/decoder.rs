@@ -306,7 +306,6 @@ mod tests {
         let ix1 = IdlInstruction {
             name: "test_ix".to_string(),
             discriminator: vec![1, 2, 3, 4, 5, 6, 7, 8],
-            docs: None,
             accounts: vec![],
             args: vec![],
         };
