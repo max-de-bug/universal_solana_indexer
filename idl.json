@@ -1,0 +1,39 @@
+{
+  "metadata": {
+    "name": "test_program",
+    "version": "0.1.0"
+  },
+  "instructions": [
+    {
+      "name": "initialize",
+      "accounts": [
+        { "name": "user", "writable": true, "signer": true },
+        { "name": "state", "writable": true, "signer": false }
+      ],
+      "args": [
+        { "name": "bump", "type": "u8" }
+      ]
+    }
+  ],
+  "accounts": [
+    {
+      "name": "GlobalState",
+      "discriminator": [1, 2, 3, 4, 5, 6, 7, 8]
+    }
+  ],
+  "types": [
+    {
+      "name": "GlobalState",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          { "name": "admin", "type": "pubkey" },
+          { "name": "is_initialized", "type": "bool" },
+          { "name": "count", "type": "u64" }
+        ]
+      }
+    }
+  ],
+  "events": [],
+  "errors": []
+}

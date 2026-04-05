@@ -2,6 +2,7 @@ use thiserror::Error;
 
 /// Unified error type for the indexer.
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum IndexerError {
     #[error("RPC error: {0}")]
     Rpc(String),

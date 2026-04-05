@@ -35,7 +35,11 @@ async fn main() -> anyhow::Result<()> {
     info!("Starting Universal Solana Indexer");
 
     let config = Config::from_env()?;
-    let pool = db::create_pool(&config.database_url).await?;
+    let pool = db::create_pool(
+        &config.database_url,
+        config.db_max_connections,
+        config.db_min_connections,
+    ).await?;
 
     // ---- IDL loading (file → on-chain) --------------------------------------
     let idl = load_idl(&config).await?;
@@ -53,6 +57,7 @@ async fn main() -> anyhow::Result<()> {
         program_name: idl.metadata.name.clone(),
         program_id: config.program_id.to_string(),
         account_types,
+        started_at: std::time::Instant::now(),
     });
 
     let app = api::router(api_state).layer(CorsLayer::permissive());

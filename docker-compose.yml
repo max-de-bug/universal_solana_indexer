@@ -15,6 +15,10 @@ services:
       test: ["CMD-SHELL", "pg_isready -U indexer"]
       interval: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
 
   indexer:
     build: .
@@ -24,11 +28,22 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgres://indexer:indexer@postgres:5432/solana_indexer
+      RUST_LOG: universal_solana_indexer=info,sqlx=warn
     ports:
       - "3000:3000"
     volumes:
       - ./idl.json:/app/idl.json:ro
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "2.0"
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
 
 volumes:
   pgdata:

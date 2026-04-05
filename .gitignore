@@ -1,1 +1,11 @@
 /target
+.env
+.env.local
+.cargo/
+*.log
+
+# Debug artifacts
+compile_errors.txt
+diff.txt
+log_check*.txt
+log_test*.txt

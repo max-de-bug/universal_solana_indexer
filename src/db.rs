@@ -2,18 +2,26 @@ use crate::error::IndexerError;
 use crate::idl::{idl_type_to_sql, AnchorIdl};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use std::time::Duration;
 use tracing::info;
 
 // ---------------------------------------------------------------------------
 // Pool creation
 // ---------------------------------------------------------------------------
 
-pub async fn create_pool(database_url: &str) -> Result<PgPool, IndexerError> {
+pub async fn create_pool(
+    database_url: &str,
+    max_connections: u32,
+    min_connections: u32,
+) -> Result<PgPool, IndexerError> {
     let pool = PgPoolOptions::new()
-        .max_connections(10)
+        .max_connections(max_connections)
+        .min_connections(min_connections)
+        .acquire_timeout(Duration::from_secs(10))
+        .idle_timeout(Duration::from_secs(300))
         .connect(database_url)
         .await?;
-    info!("Connected to PostgreSQL");
+    info!(%max_connections, %min_connections, "Connected to PostgreSQL");
     Ok(pool)
 }
 
@@ -117,7 +125,8 @@ async fn create_instructions_table(pool: &PgPool) -> Result<(), IndexerError> {
             raw_data               BYTEA,
             indexed_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             CONSTRAINT fk_ix_tx FOREIGN KEY (transaction_signature)
-                REFERENCES transactions(signature)
+                REFERENCES transactions(signature),
+            CONSTRAINT uq_ix_sig_idx UNIQUE (transaction_signature, instruction_index)
         )",
     )
     .execute(pool)
@@ -141,7 +150,8 @@ async fn create_account_table(
     account_name: &str,
     fields: Option<&Vec<crate::idl::IdlField>>,
 ) -> Result<(), IndexerError> {
-    let table = format!("\"{}\"" , sanitize_name(&format!("{program_name}_{account_name}")));
+    let raw_table = sanitize_name(&format!("{program_name}_{account_name}"));
+    let table = format!("\"{raw_table}\"");
 
     let mut cols = vec![
         "id                     BIGSERIAL   PRIMARY KEY".to_string(),
@@ -165,8 +175,8 @@ async fn create_account_table(
     sqlx::query(&ddl).execute(pool).await?;
 
     for idx in &[
-        format!("CREATE INDEX IF NOT EXISTS idx_{table}_pubkey ON {table}(pubkey)"),
-        format!("CREATE INDEX IF NOT EXISTS idx_{table}_slot   ON {table}(slot)"),
+        format!("CREATE INDEX IF NOT EXISTS idx_{raw_table}_pubkey ON {table}(pubkey)"),
+        format!("CREATE INDEX IF NOT EXISTS idx_{raw_table}_slot   ON {table}(slot)"),
     ] {
         sqlx::query(idx).execute(pool).await?;
     }
@@ -181,7 +191,8 @@ async fn create_instruction_table(
     ix_name: &str,
     fields: &[crate::idl::IdlField],
 ) -> Result<(), IndexerError> {
-    let table = format!("\"{}\"" , sanitize_name(&format!("{program_name}_ix_{ix_name}")));
+    let raw_table = sanitize_name(&format!("{program_name}_ix_{ix_name}"));
+    let table = format!("\"{raw_table}\"");
 
     let mut cols = vec![
         "id                     BIGSERIAL   PRIMARY KEY".to_string(),
@@ -200,7 +211,7 @@ async fn create_instruction_table(
     let ddl = format!("CREATE TABLE IF NOT EXISTS {table} ({})", cols.join(", "));
     sqlx::query(&ddl).execute(pool).await?;
 
-    let idx = format!("CREATE INDEX IF NOT EXISTS idx_{table}_tx ON {table}(transaction_signature)");
+    let idx = format!("CREATE INDEX IF NOT EXISTS idx_{raw_table}_tx ON {table}(transaction_signature)");
     sqlx::query(&idx).execute(pool).await?;
 
     Ok(())

@@ -8,6 +8,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::error;
 
 use crate::db::sanitize_name;
@@ -21,11 +22,13 @@ pub struct ApiState {
     pub program_name: String,
     pub program_id: String,
     pub account_types: Vec<String>,
+    pub started_at: Instant,
 }
 
 pub fn router(state: Arc<ApiState>) -> Router {
     Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/metrics", get(metrics))
         .route("/api/v1/transactions", get(list_transactions))
         .route("/api/v1/instructions", get(list_instructions))
         .route("/api/v1/accounts/:account_type", get(list_accounts))
@@ -209,8 +212,64 @@ fn apply_params_scalar<'a, T>(
 // Handlers
 // ---------------------------------------------------------------------------
 
-async fn health() -> &'static str {
-    "OK"
+async fn health(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    let db_ok = sqlx::query("SELECT 1")
+        .execute(&state.pool)
+        .await
+        .is_ok();
+    let uptime = state.started_at.elapsed().as_secs();
+    let status = if db_ok { "healthy" } else { "degraded" };
+    Json(serde_json::json!({
+        "status": status,
+        "database_connected": db_ok,
+        "program_id": state.program_id,
+        "uptime_seconds": uptime,
+    }))
+}
+
+/// Prometheus-compatible metrics endpoint.
+async fn metrics(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    let total_tx: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transactions")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(0);
+    let total_ix: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM instructions")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(0);
+    let latest_slot: Option<i64> = sqlx::query_scalar("SELECT MAX(slot) FROM transactions")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(None);
+    let pool_size = state.pool.size();
+    let pool_idle = state.pool.num_idle();
+
+    let body = format!(
+        "# HELP indexer_transactions_total Total indexed transactions\n\
+         # TYPE indexer_transactions_total gauge\n\
+         indexer_transactions_total {}\n\
+         # HELP indexer_instructions_total Total indexed instructions\n\
+         # TYPE indexer_instructions_total gauge\n\
+         indexer_instructions_total {}\n\
+         # HELP indexer_latest_slot Latest indexed slot\n\
+         # TYPE indexer_latest_slot gauge\n\
+         indexer_latest_slot {}\n\
+         # HELP indexer_db_pool_size Current DB pool connections\n\
+         # TYPE indexer_db_pool_size gauge\n\
+         indexer_db_pool_size {}\n\
+         # HELP indexer_db_pool_idle Idle DB pool connections\n\
+         # TYPE indexer_db_pool_idle gauge\n\
+         indexer_db_pool_idle {}\n",
+        total_tx,
+        total_ix,
+        latest_slot.unwrap_or(0),
+        pool_size,
+        pool_idle,
+    );
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        body,
+    )
 }
 
 async fn list_transactions(

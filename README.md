@@ -15,14 +15,15 @@ It handles automated mapping of complex `serde_json` blobs into strict SQL types
 - **Advanced Dynamic DML:** Arbitrary transaction instruction arguments and Account State mutations are extracted, decoded against your IDL discriminator, and recursively dumped entirely into explicit PostgreSQL columns intelligently.
 - **Global Account State Memory Polling:** An independent background `tokio::spawn` daemon continuously polls `getProgramAccounts`, syncing global program account states directly into your database independently of transaction-mutations (capturing completely static or pre-indexer accounts).
 - **V2 EMA Load Balancing:** An integrated `parking_lot::RwLock` cluster evaluates RPC endpoint heal-states, tracking successful API rates, Exponential Moving Average (EMA) latency ms, and slot-lags to mathematically route execution logic away from unhealthy or rate-limited nodes.
+- **Prometheus Metrics:** Built-in `/api/v1/metrics` endpoint exposes transaction counts, instruction counts, latest slot, and DB pool stats in Prometheus-compatible text format.
 
 ---
 
 ## 🚀 Quickstart
 
 ### 1. Prerequisites
-- **Rust** (`cargo build --release`)
-- **PostgreSQL Database**
+- **Rust** 1.82+ (`cargo build --release`)
+- **PostgreSQL 14+** (or Docker)
 - **Solana API Endpoints** (Both HTTP and WebSocket are supported natively)
 
 ### 2. Configure `.env`
@@ -42,6 +43,15 @@ PROGRAM_ID=your_program_pubkey
 # (Use IDL_ACCOUNT to dynamically uncompress the schema from on-chain)
 IDL_PATH=./target/idl/my_program.json
 # IDL_ACCOUNT=your_idl_pubkey
+
+# Indexing mode: "realtime" (default), "batch", "batch_signatures"
+INDEXING_MODE=realtime
+
+# Tuning
+BATCH_SIZE=100
+BATCH_CONCURRENCY=5
+DB_MAX_CONNECTIONS=10
+DB_MIN_CONNECTIONS=2
 ```
 
 ### 3. Run the Indexer
@@ -52,14 +62,93 @@ cargo build --release
 
 ---
 
-## 📊 Advanced Analytics API
+## 🐳 Docker Deployment
+
+The simplest way to deploy is with Docker Compose, which starts both PostgreSQL and the indexer:
+
+```bash
+# 1. Copy and edit .env.example
+cp .env.example .env
+# Edit .env with your PROGRAM_ID, RPC_URLS, IDL_PATH...
+
+# 2. Place your IDL
+cp my_program.json idl.json
+
+# 3. Launch
+docker compose up -d
+
+# 4. Check logs
+docker compose logs -f indexer
+
+# 5. Verify health
+curl http://localhost:3000/api/v1/health
+```
+
+The indexer container runs as a non-root user and includes a built-in healthcheck.
+
+---
+
+## 📊 REST API
 
 The Indexer ships with a bundled Axum-powered HTTP API designed for maximum query velocity and granular data extraction.
 
-- **`GET /api/v1/transactions`** Filter parsed transactions by `signature`, `success`, `slot_from`, and `slot_to`.
-- **`GET /api/v1/instructions`** Extract dynamic table rows securely filtered by `instruction_name` or `program_id`.
-- **`GET /api/v1/accounts/:account_type`** Read explicit IDL account shapes (e.g. `/api/v1/accounts/UserProfile`) mapped sequentially against their historical block allocations.
-- **`GET /api/v1/stats/instructions`** View highly-calibrated time aggregations (grouped natively by POSTGRES `date_trunc('hour')`) to monitor usage volume directly dynamically natively.
+| Endpoint | Description |
+|---|---|
+| `GET /api/v1/health` | JSON health status with DB connectivity, uptime, and program ID |
+| `GET /api/v1/metrics` | Prometheus-compatible metrics (transactions, instructions, slot, pool) |
+| `GET /api/v1/transactions` | Filter parsed transactions by `signature`, `success`, `slot_from`, `slot_to` |
+| `GET /api/v1/instructions` | Extract instructions filtered by `instruction_name` or `program_id` |
+| `GET /api/v1/accounts/:type` | Read IDL account shapes (e.g. `/accounts/UserProfile`) with slot history |
+| `GET /api/v1/stats` | Aggregate stats: total transactions, instruction breakdown, latest slot |
+| `GET /api/v1/stats/instructions` | Time-series aggregation `date_trunc('hour')` by instruction name |
+
+All list endpoints support `limit`, `offset`, `slot_from`, `slot_to` query parameters with paginated responses:
+```json
+{
+  "data": [...],
+  "total": 1234,
+  "limit": 50,
+  "offset": 0,
+  "has_next": true
+}
+```
+
+---
+
+## 📈 Monitoring
+
+### Prometheus
+
+Scrape `http://indexer:3000/api/v1/metrics` to collect:
+
+```
+indexer_transactions_total 15234
+indexer_instructions_total 42567
+indexer_latest_slot 330012345
+indexer_db_pool_size 10
+indexer_db_pool_idle 8
+```
+
+### Health Checks
+
+```bash
+curl http://localhost:3000/api/v1/health
+# {"status":"healthy","database_connected":true,"program_id":"...","uptime_seconds":3600}
+```
+
+---
+
+## ⚙️ Production Tuning
+
+| Parameter | Default | Description |
+|---|---|---|
+| `RPC_URLS` | mainnet | Comma-separated RPC endpoints for load-balanced failover |
+| `BATCH_CONCURRENCY` | 5 | Parallel transaction processing during batch/backfill |
+| `DB_MAX_CONNECTIONS` | 10 | Maximum PostgreSQL connections in pool |
+| `DB_MIN_CONNECTIONS` | 2 | Minimum idle connections maintained |
+| `BATCH_SIZE` | 100 | Signatures fetched per RPC page |
+| `MAX_RETRIES` | 5 | RPC retry attempts before failure |
+| `INITIAL_RETRY_DELAY_MS` | 500 | Starting delay between retries (exponential backoff) |
 
 ---
 
