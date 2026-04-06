@@ -1,6 +1,8 @@
 # Universal Solana Indexer
 
-![Universal Solana Indexer Demo](./gif_test/universal_solana_indexer-ezgif.com-video-to-gif-converter.gif)
+<img src="./gif_test/universal_solana_indexer-ezgif.com-video-to-gif-converter.gif" alt="Universal Solana Indexer Demo" width="600" />
+
+
 An ultra-fast, production-grade, and entirely dynamic Solana program indexer written in Rust.
 
 Unlike static indexers that require manual data-struct modeling for every new smart contract you interact with, the Universal Indexer reads **Anchor IDLs natively**, computes the 8-byte discriminators dynamically, and algorithmically generates and mutates strongly-typed **PostgreSQL schemas** seamlessly upon boot. 
