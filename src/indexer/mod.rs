@@ -1,5 +1,6 @@
 pub mod decoder;
 pub mod fetcher;
+pub mod grpc_stream;
 
 use crate::config::{Config, IndexingMode};
 use crate::db;
@@ -47,6 +48,7 @@ pub async fn run(state: Arc<IndexerState>) -> anyhow::Result<()> {
             run_batch_signatures(state.clone(), &sigs).await
         }
         IndexingMode::Realtime => run_realtime(state.clone()).await,
+        IndexingMode::GrpcStream => grpc_stream::run_grpc_stream(state.clone()).await,
     };
 
     if !poller_handle.is_finished() {
@@ -266,7 +268,7 @@ async fn run_realtime(state: Arc<IndexerState>) -> Result<(), IndexerError> {
 }
 
 /// Back-fill all signatures newer than `until` (or all available if None).
-async fn backfill(state: &IndexerState, until: Option<&str>) -> Result<(), IndexerError> {
+pub(crate) async fn backfill(state: &IndexerState, until: Option<&str>) -> Result<(), IndexerError> {
     let mut before: Option<String> = None;
     let mut total = 0u64;
 
@@ -336,7 +338,7 @@ async fn backfill(state: &IndexerState, until: Option<&str>) -> Result<(), Index
 // Transaction processing
 // ---------------------------------------------------------------------------
 
-async fn process_signature(
+pub(crate) async fn process_signature(
     state: &IndexerState,
     sig: &str,
 ) -> Result<u64, IndexerError> {

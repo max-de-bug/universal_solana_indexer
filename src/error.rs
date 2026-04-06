@@ -31,6 +31,9 @@ pub enum IndexerError {
     #[error("Max retries ({0}) exhausted")]
     RetriesExhausted(u32),
 
+    #[error("gRPC error: {0}")]
+    Grpc(String),
+
     #[error(transparent)]
     Anyhow(#[from] anyhow::Error),
 }

@@ -16,6 +16,7 @@ It handles automated mapping of complex `serde_json` blobs into strict SQL types
 ## ⚡️ Enterprise Features
 
 - **Automated DDL (Data Definition Language) Schemas:** Connect any Anchor `.json` IDL. The engine reads it, maps `u64`, `u8`, `Pubkey`, and complex Structs into SQL types, and builds your `CREATE TABLE` and `CREATE INDEX` queries organically on startup.
+- **Yellowstone gRPC Streaming:** Sub-second transaction ingestion via the Geyser plugin's gRPC interface (`yellowstone-grpc-proto`). Connects with TLS and optional `x-token` auth, filtered to your program's transactions, with automatic reconnect and backfill-on-disconnect.
 - **WebSocket `PubsubClient` Streaming:** Outperforms traditional 500ms RPC polling architectures by utilizing non-blocking WSS `logsSubscribe` streams. Transactions are natively pushed into the engine directly from the blockchain at near-0 network latency.
 - **Advanced Dynamic DML:** Arbitrary transaction instruction arguments and Account State mutations are extracted, decoded against your IDL discriminator, and recursively dumped entirely into explicit PostgreSQL columns intelligently.
 - **Global Account State Memory Polling:** An independent background `tokio::spawn` daemon continuously polls `getProgramAccounts`, syncing global program account states directly into your database independently of transaction-mutations (capturing completely static or pre-indexer accounts).
@@ -42,20 +43,21 @@ It handles automated mapping of complex `serde_json` blobs into strict SQL types
       │                      └───────┬───────┘         └──────────┬──────────┘
       │                              │                            │
       │  ┌───────────────────────────┤                            │
-      │  │  Three indexing modes:    │                            │
+      │  │  Four indexing modes:     │                            │
       │  │                           │                            │
-      │  │  1. Realtime (WSS)        │                            │
-      │  │  2. Batch (slot range)    │                            │
-      │  │  3. Batch (signatures)    │                            │
+      │  │  1. gRPC Stream (Geyser)  │                            │
+      │  │  2. Realtime (WSS)        │                            │
+      │  │  3. Batch (slot range)    │                            │
+      │  │  4. Batch (signatures)    │                            │
       │  └───────────────────────────┤                            │
       │                              ▼                            │
-      │                     ┌────────────────┐                    │
-      │                     │    Decoder     │                    │
-      │                     │  discriminator │                    │
-      │                     │  + Borsh parse │                    │
-      │                     └───────┬────────┘                    │
-      │                             │ decoded JSON                │
-      │                             ▼                             ▼
+      │  ┌────────────────┐ ┌────────────────┐                    │
+      │  │ Yellowstone    │ │    Decoder     │                    │
+      │  │ gRPC Client    │ │  discriminator │                    │
+      │  │ (sub-second)   │ │  + Borsh parse │                    │
+      │  └───────┬────────┘ └───────┬────────┘                    │
+      │          │ signatures       │ decoded JSON                │
+      │          ▼                  ▼                             ▼
       │                     ┌────────────────────────────────────────┐
       │                     │        DB Writer (atomic txns)         │
       │                     │  insert_transaction + insert_instruction│
@@ -84,13 +86,14 @@ It handles automated mapping of complex `serde_json` blobs into strict SQL types
 ```text
 src/
 ├── main.rs            Startup, dependency injection, IDL loading, graceful shutdown
-├── config.rs          Env-based configuration with three IndexingMode variants
+├── config.rs          Env-based configuration with four IndexingMode variants
 ├── db.rs              Dynamic DDL schema builder, jsonb type coercions, all INSERT logic
 ├── idl.rs             Anchor IDL parser (v0.29 & v0.30+), discriminator computation
 ├── api.rs             Axum REST API: health, metrics, paginated queries, stats
 ├── error.rs           Unified IndexerError enum
 └── indexer/
     ├── mod.rs          Mode dispatcher, WSS processor, backfill loop, account poller
+    ├── grpc_stream.rs  Yellowstone gRPC streaming: TLS connect, subscribe, queue worker
     ├── fetcher.rs      Multi-node RPC client with EMA scoring and retry macro
     └── decoder.rs      Runtime Borsh decoder, discriminator matching, BorshReader cursor
 ```
@@ -103,7 +106,8 @@ src/
 | **Schema Builder** | Generates `CREATE TABLE` + `CREATE INDEX` DDL dynamically from IDL definitions at startup | `initialize_schema`, `create_account_table` |
 | **Fetcher** | Multi-RPC load balancer with EMA latency tracking, success-rate scoring, and exponential backoff retries | `Fetcher`, `NodeMetrics`, `retry_rpc!` macro |
 | **Decoder** | Matches 8-byte discriminators, then walks raw Borsh bytes to produce `serde_json::Value` using the IDL type tree | `BorshReader`, `decode_fields`, `decode_type` |
-| **Indexer** | Orchestrates realtime/batch modes, backfill-on-reconnect, concurrent signature processing | `IndexerState`, `run_realtime`, `backfill` |
+| **Indexer** | Orchestrates realtime/batch/gRPC modes, backfill-on-reconnect, concurrent signature processing | `IndexerState`, `run_realtime`, `run_grpc_stream`, `backfill` |
+| **gRPC Stream** | Yellowstone Geyser subscription with TLS, `x-token` auth, bounded worker queue, auto-reconnect | `run_grpc_stream`, `connect_grpc`, `subscribe` |
 | **Account Poller** | Background daemon calling `getProgramAccounts` every 30s to capture pre-existing state | `run_account_poller` |
 | **API** | Stateless Axum HTTP server with typed query builders, Prometheus metrics, health checks | `ApiState`, `QueryBuilder` |
 
@@ -173,7 +177,7 @@ PROGRAM_ID=your_program_pubkey
 IDL_PATH=./idl.json
 # IDL_ACCOUNT=your_idl_pubkey   # Alternative: fetch from on-chain
 
-# Indexing mode: "realtime" (default), "batch", "batch_signatures"
+# Indexing mode: "realtime" (default), "batch", "batch_signatures", "grpc_stream"
 INDEXING_MODE=realtime
 
 # Tuning
@@ -184,6 +188,11 @@ DB_MIN_CONNECTIONS=2
 API_PORT=3000
 MAX_RETRIES=5
 INITIAL_RETRY_DELAY_MS=500
+
+# gRPC streaming (only needed for grpc_stream mode)
+# GRPC_ENDPOINT=https://your-yellowstone-endpoint:10000
+# GRPC_X_TOKEN=your-api-key-if-required
+# GRPC_QUEUE_SIZE=1000
 ```
 
 ### Production Tuning
@@ -197,6 +206,9 @@ INITIAL_RETRY_DELAY_MS=500
 | `BATCH_SIZE` | 100 | Signatures fetched per RPC page |
 | `MAX_RETRIES` | 5 | RPC retry attempts before failure |
 | `INITIAL_RETRY_DELAY_MS` | 500 | Starting delay between retries (exponential backoff) |
+| `GRPC_ENDPOINT` | — | Yellowstone gRPC URL (required for `grpc_stream` mode) |
+| `GRPC_X_TOKEN` | — | Optional auth token sent as `x-token` gRPC metadata |
+| `GRPC_QUEUE_SIZE` | 1000 | Bounded channel size between gRPC receiver and processor |
 
 ---
 
@@ -396,6 +408,14 @@ All list endpoints support `limit`, `offset`, `slot_from`, `slot_to` query param
 **Decision:** A single `tokio_util::CancellationToken` is shared across all async tasks (API server, indexer, account poller). `Ctrl+C` triggers cancellation, and each task checks `is_cancelled()` at its natural yield points.
 
 **Why:** Hard kills can leave database transactions uncommitted, WebSocket subscriptions dangling, and connection pools dirty. Cooperative cancellation lets each task finish its current unit of work and clean up resources.
+
+### 9. Yellowstone gRPC as Notification Channel (not Full-Decode)
+
+**Decision:** The `grpc_stream` mode uses the Yellowstone Geyser gRPC feed solely as a low-latency **notification channel** — it extracts transaction signatures from gRPC updates and feeds them into the same `process_signature()` pipeline that fetches full transaction data via JSON-RPC.
+
+**Why:** The Geyser protobuf types provide raw account data and transaction metadata, but not in the `EncodedConfirmedTransactionWithStatusMeta` format our Borsh decoder and IDL pipeline expect. Rather than maintaining two parallel decode paths (one for gRPC protos, one for JSON-RPC types), we reuse 100% of the existing decode logic. The gRPC stream provides the latency benefit (sub-second signature detection vs. WSS polling), while the single-hop JSON-RPC fetch provides format compatibility.
+
+**Trade-off:** Each gRPC-detected transaction still requires one `getTransaction` RPC call. This adds ~50–150 ms per transaction compared to decoding directly from gRPC protos. For most programs this is negligible — the bottleneck is DB writes, not RPC fetches. For extremely high-throughput programs (>1000 txs/s), a direct-decode path could be added later as an optimization.
 
 ---
 

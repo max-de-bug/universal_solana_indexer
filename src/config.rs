@@ -27,6 +27,12 @@ pub struct Config {
     pub db_max_connections: u32,
     /// Minimum number of idle database connections in the pool.
     pub db_min_connections: u32,
+    /// Yellowstone gRPC endpoint URL (required when `INDEXING_MODE=grpc_stream`).
+    pub grpc_endpoint: Option<String>,
+    /// Optional authentication token sent as `x-token` gRPC metadata.
+    pub grpc_x_token: Option<String>,
+    /// Bounded channel size between the gRPC receive loop and signature processor.
+    pub grpc_queue_size: usize,
 }
 
 /// Determines how the indexer processes data.
@@ -38,6 +44,8 @@ pub enum IndexingMode {
     BatchSignatures { signatures: Vec<String> },
     /// Subscribe to new transactions with cold-start backfill.
     Realtime,
+    /// Low-latency Yellowstone gRPC streaming via Geyser plugin.
+    GrpcStream,
 }
 
 impl Config {
@@ -77,6 +85,7 @@ impl Config {
                 anyhow::ensure!(!sigs.is_empty(), "BATCH_SIGNATURES must not be empty");
                 IndexingMode::BatchSignatures { signatures: sigs }
             }
+            "grpc_stream" => IndexingMode::GrpcStream,
             _ => IndexingMode::Realtime,
         };
 
@@ -88,6 +97,16 @@ impl Config {
         let batch_concurrency = env_or("BATCH_CONCURRENCY", "5").parse()?;
         let db_max_connections = env_or("DB_MAX_CONNECTIONS", "10").parse()?;
         let db_min_connections = env_or("DB_MIN_CONNECTIONS", "2").parse()?;
+        let grpc_endpoint = std::env::var("GRPC_ENDPOINT").ok();
+        let grpc_x_token = std::env::var("GRPC_X_TOKEN").ok();
+        let grpc_queue_size: usize = env_or("GRPC_QUEUE_SIZE", "1000").parse()?;
+
+        if matches!(mode, IndexingMode::GrpcStream) {
+            anyhow::ensure!(
+                grpc_endpoint.is_some(),
+                "GRPC_ENDPOINT must be set when INDEXING_MODE=grpc_stream"
+            );
+        }
 
         let cfg = Self {
             rpc_urls,
@@ -105,6 +124,9 @@ impl Config {
             batch_concurrency,
             db_max_connections,
             db_min_connections,
+            grpc_endpoint,
+            grpc_x_token,
+            grpc_queue_size,
         };
 
         info!(?cfg.mode, %cfg.program_id, %cfg.api_port, con = cfg.batch_concurrency, "Configuration loaded");
