@@ -1,6 +1,8 @@
 # Universal Solana Indexer
 
-<img src="./gif_test/universal_solana_indexer-ezgif.com-video-to-gif-converter.gif" alt="Universal Solana Indexer Demo" width="600" />
+<p align="center">
+  <img src="./gif_test/universal_solana_indexer-ezgif.com-video-to-gif-converter.gif" alt="Universal Solana Indexer Demo" width="600" />
+</p>
 
 
 An ultra-fast, production-grade, and entirely dynamic Solana program indexer written in Rust.
